@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse
+from starlette.requests import Request
 
 from app.audit import AuditLog
 from app.main import ApprovalIn, MandateIn, ToolCallIn, _audit_call, create_app
@@ -118,7 +119,25 @@ def invoke(app, path, *args, method="GET", **kwargs):
         route.endpoint for route in app.routes
         if route.path == path and method in route.methods
     )
-    result = endpoint(*args, **kwargs)
+    signature = inspect.signature(endpoint)
+    bound = signature.bind_partial(*args, **kwargs)
+    if "request" in signature.parameters and not isinstance(bound.arguments.get("request"), Request):
+        body = bound.arguments.pop("request", None)
+        if body is not None and "body" not in bound.arguments and "body" in signature.parameters:
+            bound.arguments["body"] = body
+        bound.arguments["request"] = Request({
+            "type": "http",
+            "method": method,
+            "path": path,
+            "headers": [],
+            "client": ("127.0.0.1", 50000),
+            "server": ("testserver", 80),
+            "scheme": "http",
+            "query_string": b"",
+            "http_version": "1.1",
+            "root_path": "",
+        })
+    result = endpoint(*bound.args, **bound.kwargs)
     if inspect.isawaitable(result):
         result = asyncio.run(result)
     if isinstance(result, JSONResponse):
@@ -424,7 +443,21 @@ class AsyncExecutionCancellation(unittest.IsolatedAsyncioTestCase):
                     if route.path == "/gateway/tool-call" and "POST" in route.methods
                 )
                 await create_mandate(MandateIn(**mandate_payload(approval_over="60.00")))
-                request = asyncio.create_task(gateway(ToolCallIn(**call_payload("30.00"))))
+                gateway_request = Request({
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/gateway/tool-call",
+                    "headers": [],
+                    "client": ("127.0.0.1", 50000),
+                    "server": ("testserver", 80),
+                    "scheme": "http",
+                    "query_string": b"",
+                    "http_version": "1.1",
+                    "root_path": "",
+                })
+                request = asyncio.create_task(
+                    gateway(request=gateway_request, body=ToolCallIn(**call_payload("30.00")))
+                )
                 self.assertTrue(await asyncio.to_thread(executor.started.wait, 2))
                 request.cancel()
                 await asyncio.sleep(0)

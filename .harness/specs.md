@@ -7,9 +7,9 @@
 [x] Update FastAPI routes in `backend/app/main.py` to `async def` and `await` the executor and judge responses to prevent event loop blocking.
 
 ## Unit 2: Edge Rate Limiting & Auth Validation
-[ ] Plan tests for rate limiting and edge authentication.
-[ ] Install `slowapi` and add a rate limiter to `backend/app/main.py` (e.g., 50 requests/minute per IP or `agent_id`) to protect `/gateway/tool-call`.
-[ ] Update `backend/app/main.py` to strictly enforce the authentication logic currently evaluated in `backend/tests/test_auth.py`. Use FastAPI `Depends()` for the API key/token.
+[x] Plan tests for rate limiting and edge authentication.
+[x] Install `slowapi` and add a rate limiter to `backend/app/main.py` (e.g., 50 requests/minute per IP or `agent_id`) to protect `/gateway/tool-call`.
+[x] Update `backend/app/main.py` to strictly enforce the authentication logic currently evaluated in `backend/tests/test_auth.py`. Use FastAPI `Depends()` for the API key/token.
 
 ## Unit 3: Advanced Injection Defense
 [ ] Plan tests verifying evasion defense against zero-width spaces and base64 payloads.

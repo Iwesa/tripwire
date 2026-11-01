@@ -32,12 +32,14 @@ to verify existing entries. The gateway requires `X-Agent-Key`; mandate, approva
 `X-Admin-Token`. Missing server credentials fail closed. Load `backend/.env` into both the API and demo-agent
 terminal environments before running the quickstart commands.
 
+The gateway also enforces a limit of 50 requests per minute per client IP and returns HTTP 429 when exceeded.
+
 ## Quickstart
 ```bash
 cd backend && python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
 cp ../.env.example .env            # add sandbox creds; leave TRIPWIRE_MODE=dry to run offline
 # Generate three independent secrets with `openssl rand -hex 32`, then load .env in this and the demo terminal.
-python3 -m unittest discover -s tests -t .      # 56 tests incl. the red-team evals
+python3 -m unittest discover -s tests -t .      # 60 tests incl. the red-team evals
 uvicorn app.main:app --reload                   # http://localhost:8000/docs
 # in other terminals, from repo root:
 python3 agent/evil_site.py

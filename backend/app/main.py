@@ -16,10 +16,13 @@ from dataclasses import dataclass, field
 from typing import Literal
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from .audit import AuditLog
 from .injection import LakeraGuardClassifier
@@ -195,6 +198,9 @@ def create_app(executor=None, judge=None, audit: AuditLog | None = None, clock=t
     )
 
     app = FastAPI(title="Tripwire", description="Spend firewall for AI agents (PayPal sandbox)")
+    limiter = Limiter(key_func=get_remote_address)
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
     if isinstance(executor, PayPalClient):
         app.add_event_handler("shutdown", executor.aclose)
     app.add_middleware(
@@ -207,7 +213,9 @@ def create_app(executor=None, judge=None, audit: AuditLog | None = None, clock=t
     def _authorize(presented: str | None, expected: str | None) -> None:
         if expected is None:
             raise HTTPException(503, "authentication is not configured")
-        if presented is None or not hmac.compare_digest(presented, expected):
+        if presented is None or not hmac.compare_digest(
+            presented.encode("utf-8"), expected.encode("utf-8")
+        ):
             raise HTTPException(401, "missing or invalid credentials")
 
     def require_agent_key(x_agent_key: str | None = Header(default=None, alias="X-Agent-Key")) -> None:
@@ -353,7 +361,8 @@ def create_app(executor=None, judge=None, audit: AuditLog | None = None, clock=t
 
     # ---- the gateway: every agent tool call goes through here ----
     @app.post("/gateway/tool-call", dependencies=[Depends(require_agent_key)])
-    async def tool_call(body: ToolCallIn):
+    @limiter.limit("50/minute")
+    async def tool_call(request: Request, body: ToolCallIn):
         call = _parse(body, call_from_dict)
         data = await asyncio.to_thread(store.get_mandate, call.agent_id)
         if data is None:

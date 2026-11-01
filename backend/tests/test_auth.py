@@ -4,10 +4,12 @@ import io
 import os
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 
 from app.main import create_app
 
@@ -22,11 +24,13 @@ DEMO_SPEC.loader.exec_module(demo_agent)
 
 class ApiAuthentication(unittest.TestCase):
     def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
         self.app = create_app(
-            database_url="sqlite:///:memory:",
+            database_url=f"sqlite:///{self.directory.name}/tripwire.db",
             agent_api_key=AGENT_KEY,
             admin_token=ADMIN_TOKEN,
         )
+        self.addCleanup(self.directory.cleanup)
         self.addCleanup(self.app.state.store.dispose)
         self.guards = self.app.state.auth_dependencies
 
@@ -46,7 +50,25 @@ class ApiAuthentication(unittest.TestCase):
         self.assertIn(self.guards["agent"], self.route_dependencies("/gateway/tool-call", "POST"))
         self.assert_rejected(self.guards["agent"], None, 401)
         self.assert_rejected(self.guards["agent"], "wrong-key", 401)
+        self.assert_rejected(self.guards["agent"], "無効な鍵", 401)
         self.assertIsNone(self.guards["agent"](AGENT_KEY))
+
+    def test_gateway_auth_is_enforced_over_http(self):
+        body = {
+            "agent_id": "agent-1",
+            "tool": "create_payout",
+            "amount": "10.00",
+            "currency": "USD",
+            "payee": "ap@example.com",
+        }
+        with TestClient(self.app) as client:
+            missing = client.post("/gateway/tool-call", json=body)
+            wrong = client.post("/gateway/tool-call", json=body, headers={"X-Agent-Key": "wrong"})
+            valid = client.post("/gateway/tool-call", json=body, headers={"X-Agent-Key": AGENT_KEY})
+
+        self.assertEqual(missing.status_code, 401)
+        self.assertEqual(wrong.status_code, 401)
+        self.assertEqual(valid.status_code, 404)
 
     def test_admin_routes_require_strong_admin_token(self):
         protected_routes = [
@@ -66,6 +88,16 @@ class ApiAuthentication(unittest.TestCase):
         self.assert_rejected(self.guards["admin"], None, 401)
         self.assert_rejected(self.guards["admin"], "wrong-token", 401)
         self.assertIsNone(self.guards["admin"](ADMIN_TOKEN))
+
+    def test_admin_auth_is_enforced_over_http(self):
+        with TestClient(self.app) as client:
+            missing = client.get("/mandates")
+            wrong = client.get("/mandates", headers={"X-Admin-Token": "wrong"})
+            valid = client.get("/mandates", headers={"X-Admin-Token": ADMIN_TOKEN})
+
+        self.assertEqual(missing.status_code, 401)
+        self.assertEqual(wrong.status_code, 401)
+        self.assertEqual(valid.status_code, 200)
 
     def test_unconfigured_authentication_fails_closed(self):
         app = create_app(database_url="sqlite:///:memory:")
@@ -91,6 +123,68 @@ class ApiAuthentication(unittest.TestCase):
                     with contextlib.redirect_stdout(io.StringIO()):
                         demo_agent.main()
             self.assertEqual(request.call_args.kwargs["headers"], {"X-Admin-Token": ADMIN_TOKEN})
+
+    def test_unconfigured_authentication_fails_closed_over_http(self):
+        directory = tempfile.TemporaryDirectory()
+        app = create_app(database_url=f"sqlite:///{directory.name}/tripwire.db")
+        try:
+            with TestClient(app) as client:
+                agent_response = client.post(
+                    "/gateway/tool-call",
+                    json={"agent_id": "agent-1", "tool": "create_payout"},
+                    headers={"X-Agent-Key": AGENT_KEY},
+                )
+                admin_response = client.get("/mandates", headers={"X-Admin-Token": ADMIN_TOKEN})
+
+            self.assertEqual(agent_response.status_code, 503)
+            self.assertEqual(admin_response.status_code, 503)
+        finally:
+            app.state.store.dispose()
+            directory.cleanup()
+
+
+class GatewayRateLimiting(unittest.TestCase):
+    def test_gateway_is_limited_to_50_requests_per_minute_per_client_ip(self):
+        directory = tempfile.TemporaryDirectory()
+        app = create_app(
+            database_url=f"sqlite:///{directory.name}/tripwire.db",
+            agent_api_key=AGENT_KEY,
+            admin_token=ADMIN_TOKEN,
+        )
+        self.addCleanup(directory.cleanup)
+        self.addCleanup(app.state.store.dispose)
+        mandate = {
+            "agent_id": "agent-1",
+            "task": "pay approved invoices",
+            "budget_total": "1000.00",
+            "per_tx_cap": "50.00",
+            "approval_over": "50.00",
+            "allowed_tools": ["create_payout"],
+            "allowed_payees": ["ap@example.com"],
+            "max_tx_per_hour": 1000,
+            "ttl_seconds": 3600,
+        }
+        call = {
+            "agent_id": "agent-1",
+            "tool": "create_payout",
+            "amount": "1.00",
+            "currency": "USD",
+            "payee": "ap@example.com",
+        }
+        with TestClient(app) as client:
+            created = client.post(
+                "/mandates", json=mandate, headers={"X-Admin-Token": ADMIN_TOKEN}
+            )
+            self.assertEqual(created.status_code, 200)
+            responses = [
+                client.post(
+                    "/gateway/tool-call", json=call, headers={"X-Agent-Key": AGENT_KEY}
+                )
+                for _ in range(51)
+            ]
+
+        self.assertEqual(sum(response.status_code == 429 for response in responses), 1)
+        self.assertEqual(responses[-1].status_code, 429)
 
 
 if __name__ == "__main__":
