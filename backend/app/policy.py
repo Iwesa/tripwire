@@ -1,0 +1,203 @@
+"""Tripwire policy engine.
+
+Design rules (see CLAUDE.md invariants):
+  1. Deterministic rules decide. They cannot be talked out of a verdict.
+  2. An LLM judge may only TIGHTEN a verdict (allow -> escalate -> deny), never loosen.
+  3. Fail closed: missing data, judge errors, odd inputs => stricter, not looser.
+  4. Every rule must trace to an attack case in evals/redteam_cases.json.
+"""
+from __future__ import annotations
+
+import difflib
+import re
+import time
+from decimal import Decimal
+from typing import Callable
+
+from .models import MONEY_MOVING, Decision, Finding, Mandate, ToolCall, Verdict
+
+# --- injection heuristics -------------------------------------------------
+INJECTION_PATTERNS: dict[str, re.Pattern] = {
+    name: re.compile(rx, re.I | re.S)
+    for name, rx in {
+        "override_instructions": r"\b(ignore|disregard|forget)\b.{0,30}\b(previous|prior|above|earlier|all)\b.{0,30}\b(instructions?|rules?|prompts?)\b",
+        "role_hijack": r"\byou are now\b|\bact as (an? )?(admin|administrator|developer|system)\b|\bnew (system )?instructions?\b",
+        "secrecy": r"\b(do not|don't|never)\b.{0,20}\b(tell|inform|alert|notify|mention)\b.{0,20}\b(user|human|owner)\b",
+        "urgent_payment": r"\b(send|pay|transfer|wire|refund|payout)\b.{0,60}\b(immediately|right now|urgent|asap)\b",
+        "tool_directive": r"\b(call|invoke|use|execute)\b.{0,20}\b(create_payout|create_order|capture_order|create_refund|pay_order)\b",
+    }.items()
+}
+
+
+def injection_signals(text: str) -> list[str]:
+    return [name for name, rx in INJECTION_PATTERNS.items() if rx.search(text or "")]
+
+
+# --- lookalike payee detection -------------------------------------------
+_HOMOGLYPHS = str.maketrans({"1": "l", "0": "o", "5": "s", "3": "e", "$": "s"})
+
+
+def _norm(s: str) -> str:
+    return s.lower().translate(_HOMOGLYPHS).replace("rn", "m").replace("vv", "w")
+
+
+def lookalike_of(payee: str, allowed) -> str | None:
+    """Return the allowlisted payee this one imitates, if any."""
+    p = payee.lower()
+    for a in allowed:
+        if p == a.lower():
+            continue
+        if _norm(p) == _norm(a) or difflib.SequenceMatcher(None, _norm(p), _norm(a)).ratio() >= 0.88:
+            return a
+    return None
+
+
+class PolicyEngine:
+    def __init__(self, judge=None, clock: Callable[[], float] = time.time,
+                 disabled_rules: frozenset = frozenset(), state_store=None):
+        self.judge = judge
+        self.clock = clock
+        self.state_store = state_store
+        # Test-only: lets the eval suite prove every rule is necessary (see test_every_rule_is_necessary).
+        self.disabled_rules = disabled_rules
+        self._spent: dict[str, Decimal] = {}
+        self._times: dict[str, list[float]] = {}
+
+    # -- state ------------------------------------------------------------
+    def spent(self, agent_id: str) -> Decimal:
+        if self.state_store is not None:
+            return self.state_store.policy_state(agent_id, self.clock())[0]
+        return self._spent.get(agent_id, Decimal("0"))
+
+    def recent_count(self, agent_id: str, window: float = 3600) -> int:
+        now = self.clock()
+        if self.state_store is not None:
+            return self.state_store.policy_state(agent_id, now, window)[1]
+        return sum(1 for t in self._times.get(agent_id, []) if now - t < window)
+
+    def record(self, call: ToolCall) -> None:
+        """Call after a money-moving action actually executes (or is approved)."""
+        if self.state_store is not None:
+            self.state_store.record(call, self.clock())
+            return
+        if call.tool in MONEY_MOVING and call.amount is not None:
+            self._spent[call.agent_id] = self.spent(call.agent_id) + call.amount
+        self._times.setdefault(call.agent_id, []).append(self.clock())
+
+    def evaluate_and_reserve(self, mandate: Mandate, call: ToolCall,
+                             reserve_escalations: bool = False) -> tuple[Verdict, int | None]:
+        if self.state_store is None:
+            return self.evaluate(mandate, call), None
+        return self.state_store.atomic_admit(
+            mandate,
+            call,
+            self.clock(),
+            lambda m, c, state: self.evaluate(m, c, state),
+            allow_escalate=reserve_escalations,
+        )
+
+    def commit_reservation(self, reservation_id: int) -> None:
+        self.state_store.commit_reservation(reservation_id)
+
+    def release_reservation(self, reservation_id: int) -> None:
+        self.state_store.release_reservation(reservation_id)
+
+    # -- evaluation -------------------------------------------------------
+    def evaluate(self, mandate: Mandate, call: ToolCall,
+                 state: tuple[Decimal, int] | None = None) -> Verdict:
+        f: list[Finding] = []
+
+        def add(rule: str, decision: Decision, detail: str) -> None:
+            if rule not in self.disabled_rules:
+                f.append(Finding(rule, decision, detail))
+
+        # 0. hard gates
+        if mandate.revoked:
+            add("kill_switch", Decision.DENY, "mandate revoked by owner")
+            return self._verdict(f)
+        if mandate.expires_at is not None and mandate.expires_at < self.clock():
+            add("mandate_expired", Decision.DENY, "mandate has expired")
+            return self._verdict(f)
+        if call.agent_id != mandate.agent_id:
+            add("agent_mismatch", Decision.DENY, "call agent does not match mandate agent")
+            return self._verdict(f)
+        if call.tool not in mandate.allowed_tools:
+            add("tool_not_allowed", Decision.DENY, f"tool '{call.tool}' is not in this mandate")
+            return self._verdict(f)
+
+        is_money = call.tool in MONEY_MOVING
+
+        if is_money:
+            self._money_rules(mandate, call, add, state)
+            self._payee_rules(mandate, call, add)
+
+        self._provenance_rules(mandate, call, is_money, add)
+
+        # LLM judge: advisory, tighten-only, fail-closed.
+        if self.judge is not None and is_money and max((x.decision for x in f), default=Decision.ALLOW) < Decision.DENY:
+            try:
+                jr = self.judge.judge(mandate, call, tuple(f))
+                add("llm_judge", jr.decision, jr.rationale)
+            except Exception as e:  # noqa: BLE001 - judge failure must never loosen
+                add("llm_judge_error", Decision.ESCALATE, f"judge unavailable, failing closed: {type(e).__name__}")
+
+        return self._verdict(f)
+
+    # -- rule groups ------------------------------------------------------
+    def _money_rules(self, m: Mandate, c: ToolCall, add,
+                     state: tuple[Decimal, int] | None = None) -> None:
+        if c.amount is None:
+            add("amount_missing", Decision.DENY, "money-moving call without a verifiable amount")
+            return
+        if c.amount <= 0:
+            add("amount_invalid", Decision.DENY, f"non-positive amount {c.amount}")
+            return
+        if c.currency != m.currency:
+            add("currency_mismatch", Decision.DENY, f"{c.currency} != mandate currency {m.currency}")
+        if c.amount > m.per_tx_cap:
+            add("per_tx_cap", Decision.DENY, f"{c.amount} exceeds per-transaction cap {m.per_tx_cap}")
+        spent = state[0] if state is not None else self.spent(c.agent_id)
+        if spent + c.amount > m.budget_total:
+            add("budget_exceeded", Decision.DENY, f"spent {spent} + {c.amount} > budget {m.budget_total}")
+        n = state[1] if state is not None else self.recent_count(c.agent_id)
+        if n >= m.max_tx_per_hour:
+            add("velocity", Decision.DENY, f"{n} transactions in the last hour (max {m.max_tx_per_hour})")
+        if m.per_tx_cap >= c.amount > m.approval_over:
+            add("approval_threshold", Decision.ESCALATE, f"{c.amount} > auto-approve limit {m.approval_over}")
+
+    def _payee_rules(self, m: Mandate, c: ToolCall, add) -> None:
+        if not c.payee:
+            add("payee_missing", Decision.DENY, "money-moving call without a declared payee")
+            return
+        if c.payee.lower() in m.allowed_payees:
+            return
+        imitated = lookalike_of(c.payee, m.allowed_payees)
+        if imitated:
+            add("lookalike_payee", Decision.DENY, f"'{c.payee}' imitates allowlisted payee '{imitated}'")
+        elif m.payee_mode == "allowlist":
+            add("payee_not_allowlisted", Decision.DENY, f"'{c.payee}' is not an approved payee")
+        else:
+            add("new_payee", Decision.ESCALATE, f"first payment to '{c.payee}' needs human approval")
+
+    def _provenance_rules(self, m: Mandate, c: ToolCall, is_money: bool, add) -> None:
+        """Taint tracking: where did the payee/amount come from?"""
+        for s in c.sources:
+            if s.trust != "untrusted":
+                continue
+            ex = (s.excerpt or "").lower()
+            signals = injection_signals(s.excerpt)
+            payee_tainted = bool(c.payee) and c.payee.lower() in ex
+            amount_tainted = c.amount is not None and str(c.amount) in ex
+            allowlisted = bool(c.payee) and c.payee.lower() in m.allowed_payees
+
+            if is_money and payee_tainted and not allowlisted:
+                sev = "with injection patterns " + str(signals) if signals else "unverified"
+                add("tainted_payee", Decision.DENY, f"payee came from untrusted content at {s.url} ({sev})")
+            elif is_money and signals:
+                tag = " (payee/amount echoed from it)" if (payee_tainted or amount_tainted) else ""
+                add("injection_signal", Decision.ESCALATE, f"untrusted source {s.url} contains {signals}{tag}")
+
+    @staticmethod
+    def _verdict(findings: list[Finding]) -> Verdict:
+        decision = max((x.decision for x in findings), default=Decision.ALLOW)
+        return Verdict(decision, findings)
