@@ -5,12 +5,15 @@ NOTE: written without FastAPI available in the authoring sandbox - run
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import hmac
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Literal
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -114,6 +117,60 @@ def _configured_secret(name: str, supplied: str | None) -> str | None:
     return value
 
 
+_AUDIT_SECRET_KEY_PARTS = (
+    "password", "passwd", "secret", "token", "apikey", "authorization", "cookie",
+    "credential", "clientid", "privatekey", "signingkey", "signature",
+)
+_AUDIT_SECRET_VALUE = re.compile(
+    r"(?i)\b((?:bearer\s+)|(?:api[_-]?key|access[_-]?token|refresh[_-]?token|"
+    r"password|passwd|secret|authorization)\s*[:=]\s*)[^\s,;&]+"
+)
+_AUDIT_URL = re.compile(r"https?://[^\s<>\"')]+")
+_AUDIT_SAFE_QUERY_KEYS = frozenset({"id", "ref", "page", "source", "invoice", "lang", "item"})
+
+
+def _is_audit_secret_key(key: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", key.lower())
+    return normalized in {"key", "sig"} or any(part in normalized for part in _AUDIT_SECRET_KEY_PARTS)
+
+
+def _redact_audit_value(value):
+    if isinstance(value, dict):
+        return {
+            key: "[REDACTED]" if _is_audit_secret_key(str(key)) else _redact_audit_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_audit_value(item) for item in value]
+    if isinstance(value, str):
+        value = _AUDIT_SECRET_VALUE.sub(r"\1[REDACTED]", value)
+        return _AUDIT_URL.sub(lambda match: _audit_url(match.group(0)), value)
+    return value
+
+
+def _audit_url(url: str) -> str:
+    parts = urlsplit(url)
+    query = [
+        (key, _redact_audit_value(value)
+         if key.lower() in _AUDIT_SAFE_QUERY_KEYS and not _is_audit_secret_key(key)
+         else "[REDACTED]")
+        for key, value in parse_qsl(parts.query, keep_blank_values=True)
+    ]
+    return urlunsplit((parts.scheme, parts.netloc.rsplit("@", 1)[-1], parts.path,
+                       urlencode(query, doseq=True), _redact_audit_value(parts.fragment)))
+
+
+def _audit_call(call: ToolCall) -> dict:
+    record = call.to_dict()
+    record["args"] = _redact_audit_value(record.get("args", {}))
+    record.pop("agent_note", None)
+    record["sources"] = [
+        {"url": _audit_url(source["url"]), "trust": source["trust"]}
+        for source in record["sources"]
+    ]
+    return _redact_audit_value(record)
+
+
 def create_app(executor=None, judge=None, audit: AuditLog | None = None, clock=time.time,
                database_url: str | None = None, agent_api_key: str | None = None,
                admin_token: str | None = None) -> FastAPI:
@@ -156,22 +213,73 @@ def create_app(executor=None, judge=None, audit: AuditLog | None = None, clock=t
     def _parse(model: BaseModel, builder):
         return _parse_dict(model.model_dump(), builder)
 
-    def _execute(call: ToolCall, via: str, reservation_id: int | None = None) -> dict:
+    async def _execute(call: ToolCall, via: str, reservation_id: int | None = None) -> dict:
         try:
-            result = executor.execute(call)
-        except Exception as e:
+            await audit.append("tool_call_execution_started", call.agent_id,
+                               {"via": via, "call": _audit_call(call)})
+        except BaseException:
             if reservation_id is not None:
-                engine.release_reservation(reservation_id)
-            if not isinstance(e, (PayPalError, ValueError)):
+                try:
+                    await asyncio.shield(asyncio.to_thread(engine.release_reservation, reservation_id))
+                except BaseException:
+                    pass
+            raise
+
+        async def execute_and_record() -> dict:
+            try:
+                result = await asyncio.to_thread(executor.execute, call)
+            except Exception as e:
+                release_error = None
+                if reservation_id is not None:
+                    try:
+                        await asyncio.to_thread(engine.release_reservation, reservation_id)
+                    except Exception as cleanup_error:
+                        release_error = cleanup_error
+                failure = {
+                    "call": _audit_call(call),
+                    "error": _redact_audit_value(str(e)[:300]),
+                }
+                if release_error is not None:
+                    failure["reservation_release_error"] = _redact_audit_value(str(release_error)[:300])
+                await audit.append("execution_failed", call.agent_id, failure)
+                if release_error is not None:
+                    raise RuntimeError("execution failed and reservation release failed") from release_error
+                if isinstance(e, (PayPalError, ValueError)):
+                    raise HTTPException(502, f"execution failed: {e}") from e
                 raise
-            audit.append("execution_failed", call.agent_id, {"call": call.to_dict(), "error": str(e)[:300]})
-            raise HTTPException(502, f"execution failed: {e}") from e
-        if reservation_id is None:
-            engine.record(call)
-        else:
-            engine.commit_reservation(reservation_id)
-        audit.append("tool_call_executed", call.agent_id, {"via": via, "call": call.to_dict(), "result": result})
-        return result
+
+            try:
+                if reservation_id is None:
+                    await asyncio.to_thread(engine.record, call)
+                else:
+                    await asyncio.to_thread(engine.commit_reservation, reservation_id)
+            except Exception as e:
+                await audit.append(
+                    "execution_bookkeeping_failed",
+                    call.agent_id,
+                    {
+                        "via": via,
+                        "call": _audit_call(call),
+                        "executor_completed": True,
+                        "result": _redact_audit_value(result),
+                        "error": _redact_audit_value(str(e)[:300]),
+                    },
+                )
+                raise
+            await audit.append("tool_call_executed", call.agent_id,
+                               {"via": via, "call": _audit_call(call),
+                                "result": _redact_audit_value(result)})
+            return result
+
+        execution = asyncio.create_task(execute_and_record())
+        try:
+            return await asyncio.shield(execution)
+        except asyncio.CancelledError:
+            try:
+                await asyncio.shield(execution)
+            except BaseException:
+                pass
+            raise
 
     def _public_ticket(record: dict) -> dict:
         return _ticket_from_record(record).to_dict()
@@ -182,13 +290,13 @@ def create_app(executor=None, judge=None, audit: AuditLog | None = None, clock=t
 
     # ---- mandates ----
     @app.post("/mandates", dependencies=[Depends(require_admin_token)])
-    def create_mandate(body: MandateIn):
+    async def create_mandate(body: MandateIn):
         data = body.model_dump()
         ttl = data.pop("ttl_seconds")
         data["expires_at"] = clock() + ttl if ttl else None
         m = _parse_dict(data, mandate_from_dict)
-        store.save_mandate(m.to_dict())
-        audit.append("mandate_created", m.agent_id, m.to_dict())
+        await asyncio.to_thread(store.save_mandate, m.to_dict())
+        await audit.append("mandate_created", m.agent_id, _redact_audit_value(m.to_dict()))
         return m.to_dict()
 
     @app.get("/mandates", dependencies=[Depends(require_admin_token)])
@@ -196,21 +304,22 @@ def create_app(executor=None, judge=None, audit: AuditLog | None = None, clock=t
         return store.list_mandates()
 
     @app.post("/mandates/{agent_id}/revoke", dependencies=[Depends(require_admin_token)])
-    def revoke(agent_id: str):
-        data = store.get_mandate(agent_id)
+    async def revoke(agent_id: str):
+        data = await asyncio.to_thread(store.get_mandate, agent_id)
         if data is None:
             raise HTTPException(404, "unknown agent")
         m = _parse_dict(data, mandate_from_dict)
         m.revoked = True
-        store.save_mandate(m.to_dict())
-        for record in store.list_tickets("pending"):
+        await asyncio.to_thread(store.save_mandate, m.to_dict())
+        records = await asyncio.to_thread(store.list_tickets, "pending")
+        for record in records:
             if record["call"]["agent_id"] == agent_id:
                 record["status"], record["resolved_by"] = "denied", "kill_switch"
                 reservation_id = record.get("_reservation_id")
                 if reservation_id is not None:
-                    engine.release_reservation(reservation_id)
-                store.save_ticket(record)
-        audit.append("mandate_revoked", agent_id, {"by": "owner"})
+                    await asyncio.to_thread(engine.release_reservation, reservation_id)
+                await asyncio.to_thread(store.save_ticket, record)
+        await audit.append("mandate_revoked", agent_id, {"by": "owner"})
         return {"agent_id": agent_id, "revoked": True}
 
     @app.get("/state/{agent_id}", dependencies=[Depends(require_admin_token)])
@@ -225,23 +334,32 @@ def create_app(executor=None, judge=None, audit: AuditLog | None = None, clock=t
 
     # ---- the gateway: every agent tool call goes through here ----
     @app.post("/gateway/tool-call", dependencies=[Depends(require_agent_key)])
-    def tool_call(body: ToolCallIn):
+    async def tool_call(body: ToolCallIn):
         call = _parse(body, call_from_dict)
-        data = store.get_mandate(call.agent_id)
+        data = await asyncio.to_thread(store.get_mandate, call.agent_id)
         if data is None:
             raise HTTPException(404, "no mandate for this agent")
         m = _parse_dict(data, mandate_from_dict)
-        verdict, reservation_id = engine.evaluate_and_reserve(m, call, reserve_escalations=True)
-        audit.append("tool_call_evaluated", call.agent_id, {"call": call.to_dict(), "verdict": verdict.to_dict()})
+        verdict, reservation_id = await asyncio.to_thread(
+            engine.evaluate_and_reserve, m, call, reserve_escalations=True
+        )
+        try:
+            await audit.append("tool_call_evaluated", call.agent_id,
+                               {"call": _audit_call(call),
+                                "verdict": _redact_audit_value(verdict.to_dict())})
+        except Exception:
+            if reservation_id is not None:
+                await asyncio.to_thread(engine.release_reservation, reservation_id)
+            raise
 
         if verdict.decision == Decision.DENY:
             return JSONResponse(status_code=403, content={"decision": "deny", **verdict.to_dict()})
         if verdict.decision == Decision.ESCALATE:
             t = Ticket(uuid.uuid4().hex[:10], call, verdict, clock(), reservation_id=reservation_id)
-            store.save_ticket(t.to_record())
-            audit.append("approval_requested", call.agent_id, {"ticket": t.id})
+            await asyncio.to_thread(store.save_ticket, t.to_record())
+            await audit.append("approval_requested", call.agent_id, {"ticket": t.id})
             return JSONResponse(status_code=202, content={"decision": "escalate", "ticket_id": t.id, **verdict.to_dict()})
-        result = _execute(call, via="auto", reservation_id=reservation_id)
+        result = await _execute(call, via="auto", reservation_id=reservation_id)
         return {"decision": "allow", "result": result, **verdict.to_dict()}
 
     # ---- human approvals ----
@@ -249,44 +367,59 @@ def create_app(executor=None, judge=None, audit: AuditLog | None = None, clock=t
     def approvals(status: str | None = None):
         return [_public_ticket(record) for record in store.list_tickets(status)]
 
-    def _resolve(ticket_id: str, approve: bool, who: str) -> dict:
-        record = store.get_ticket(ticket_id)
+    async def _resolve(ticket_id: str, approve: bool, who: str) -> dict:
+        record = await asyncio.to_thread(store.get_ticket, ticket_id)
         if record is None:
             raise HTTPException(404, "unknown ticket")
         t = _ticket_from_record(record)
         if t.status != "pending":
             raise HTTPException(409, f"ticket already {t.status}")
-        mandate_data = store.get_mandate(t.call.agent_id)
+        mandate_data = await asyncio.to_thread(store.get_mandate, t.call.agent_id)
         m = _parse_dict(mandate_data, mandate_from_dict) if mandate_data is not None else None
         if approve and (m is None or m.revoked):
             raise HTTPException(409, "mandate revoked; cannot approve")
-        t.status, t.resolved_by = ("approved" if approve else "denied"), who
+        new_status = "approved" if approve else "denied"
+        record, resolution_error = await asyncio.to_thread(
+            store.claim_ticket_resolution, ticket_id, new_status, who, clock()
+        )
+        if record is None:
+            if resolution_error == "unknown ticket":
+                raise HTTPException(404, resolution_error)
+            raise HTTPException(409, resolution_error)
+        t = _ticket_from_record(record)
+        try:
+            await audit.append("approval_resolved", t.call.agent_id,
+                               {"ticket": t.id, "status": t.status, "by": who})
+        except BaseException:
+            await asyncio.shield(asyncio.to_thread(store.restore_pending_ticket, t.id, who))
+            raise
         if not approve and t.reservation_id is not None:
-            engine.release_reservation(t.reservation_id)
-        store.save_ticket(t.to_record())
-        audit.append("approval_resolved", t.call.agent_id, {"ticket": t.id, "status": t.status, "by": who})
+            await asyncio.to_thread(engine.release_reservation, t.reservation_id)
         if approve:
-            t.result = _execute(t.call, via=f"human:{who}", reservation_id=t.reservation_id)
-            store.save_ticket(t.to_record())
+            t.result = await _execute(t.call, via=f"human:{who}", reservation_id=t.reservation_id)
+            await asyncio.to_thread(store.save_ticket, t.to_record())
         return t.to_dict()
 
     @app.post("/approvals/{ticket_id}/approve", dependencies=[Depends(require_admin_token)])
-    def approve(ticket_id: str, body: ApprovalIn = ApprovalIn()):
-        return _resolve(ticket_id, True, body.approver)
+    async def approve(ticket_id: str, body: ApprovalIn = ApprovalIn()):
+        return await _resolve(ticket_id, True, body.approver)
 
     @app.post("/approvals/{ticket_id}/deny", dependencies=[Depends(require_admin_token)])
-    def deny(ticket_id: str, body: ApprovalIn = ApprovalIn()):
-        return _resolve(ticket_id, False, body.approver)
+    async def deny(ticket_id: str, body: ApprovalIn = ApprovalIn()):
+        return await _resolve(ticket_id, False, body.approver)
 
     # ---- audit ----
     @app.get("/audit", dependencies=[Depends(require_admin_token)])
     def audit_list(limit: int = 100, agent_id: str | None = None):
-        return audit.entries(limit=limit, agent_id=agent_id)
+        try:
+            return audit.entries(limit=limit, agent_id=agent_id)
+        except RuntimeError as e:
+            raise HTTPException(503, "audit integrity verification failed") from e
 
     @app.get("/audit/verify", dependencies=[Depends(require_admin_token)])
     def audit_verify():
-        ok, bad = audit.verify()
-        return {"ok": ok, "first_bad_seq": bad, "entries": len(audit.entries())}
+        ok, bad, count = audit.verify_with_count()
+        return {"ok": ok, "first_bad_seq": bad, "entries": count}
 
     return app
 

@@ -30,7 +30,7 @@ Tripwire is a harness twice over, and that is the project's thesis:
 | Every rule traces to a real failure | `redteam_cases.json` + `test_every_rule_is_necessary` (mutation check) |
 | Measure, don't vibe | Scoreboard test: attacks blocked N/N, benign wrongly denied 0 |
 | Independent review with fresh context | `.harness/agents/reviewer.md`; judge sees untrusted text as quoted data only |
-| Observability | Hash-chained audit log, verify endpoint, dashboard |
+| Observability | Async append to an HMAC-signed SHA-256 chain, verify endpoint, dashboard |
 
 ## Known limitations (say these in the README; judges respect honesty)
 - Injection patterns are heuristics and evadable. The *decisive* controls (caps, allowlist, budget, velocity, kill switch)
@@ -40,4 +40,6 @@ Tripwire is a harness twice over, and that is the project's thesis:
 - `sources` are reported by the agent SDK. A fully compromised agent could omit them; deterministic rules still hold.
 - SQLite persists mandates, tickets, spend, and velocity state across restarts. SQLite serializes write transactions
   database-wide; higher-concurrency deployments should use a database with row-level locking.
+- Audit HMACs detect modification of signed entries, but truncating or rolling back the entire file requires an
+  external checkpoint or remote anchor to detect.
 - Prototype for the sandbox. Not a production payment-control product.

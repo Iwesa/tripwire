@@ -3,13 +3,19 @@ Editing, deleting or reordering any past entry breaks verification from that poi
 from __future__ import annotations
 
 import hashlib
+import hmac
+import asyncio
 import json
 import os
+import secrets
 import threading
 import time
+from contextlib import contextmanager
 from typing import Callable
 
 GENESIS = "0" * 64
+_FILE_LOCKS: dict[str, threading.Lock] = {}
+_FILE_LOCKS_GUARD = threading.Lock()
 
 
 def _canonical(body: dict) -> str:
@@ -20,47 +26,186 @@ def _digest(prev_hash: str, body: dict) -> str:
     return hashlib.sha256((prev_hash + _canonical(body)).encode("utf-8")).hexdigest()
 
 
+def _signature(key: bytes, entry: dict) -> str:
+    signed = {name: value for name, value in entry.items() if name != "hmac"}
+    return hmac.new(key, _canonical(signed).encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _process_file_lock(path: str) -> threading.Lock:
+    normalized = os.path.normcase(os.path.abspath(path))
+    with _FILE_LOCKS_GUARD:
+        return _FILE_LOCKS.setdefault(normalized, threading.Lock())
+
+
 class AuditLog:
-    def __init__(self, path: str | None = None, clock: Callable[[], float] = time.time):
+    def __init__(self, path: str | None = None, clock: Callable[[], float] = time.time,
+                 hmac_key: str | bytes | None = None):
         self.path = path
         self.clock = clock
         self._lock = threading.Lock()
+        self._file_thread_lock = _process_file_lock(path) if path else None
+        self._write_failed = False
+        if hmac_key is None:
+            hmac_key = os.getenv("TRIPWIRE_AUDIT_HMAC_KEY")
+        if isinstance(hmac_key, str):
+            hmac_key = hmac_key.encode("utf-8")
+        if not hmac_key:
+            if path:
+                raise ValueError("TRIPWIRE_AUDIT_HMAC_KEY is required for a persisted audit log")
+            hmac_key = secrets.token_bytes(32)
+        if len(hmac_key) < 32:
+            raise ValueError("audit HMAC key must be at least 32 bytes")
+        self._hmac_key = hmac_key
         self._entries: list[dict] = []
         if path and os.path.exists(path):
-            with open(path, encoding="utf-8") as fh:
-                self._entries = [json.loads(line) for line in fh if line.strip()]
+            with self._file_lock():
+                self._entries, _, _ = self._read_file_entries()
 
-    def append(self, event: str, agent_id: str, payload: dict) -> dict:
+    @contextmanager
+    def _file_lock(self):
+        if self.path is None:
+            yield
+            return
+        lock_path = self.path + ".lock"
+        with self._file_thread_lock:
+            with open(lock_path, "a+b") as lock_file:
+                if os.name == "nt":
+                    import msvcrt
+
+                    lock_file.seek(0, os.SEEK_END)
+                    if lock_file.tell() == 0:
+                        lock_file.write(b"\0")
+                        lock_file.flush()
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+                    try:
+                        yield
+                    finally:
+                        lock_file.seek(0)
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                    try:
+                        yield
+                    finally:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    def _read_file_entries(self) -> tuple[list[dict], int | None, int]:
+        entries = []
+        if self.path is None or not os.path.exists(self.path):
+            return entries, None, 0
+        parse_error = None
+        count = 0
+        with open(self.path, "rb") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                count += 1
+                try:
+                    entries.append(json.loads(line))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    if parse_error is None:
+                        parse_error = count - 1
+        return entries, parse_error, count
+
+    async def append(self, event: str, agent_id: str, payload: dict) -> dict:
+        return await asyncio.to_thread(self._append_sync, event, agent_id, payload)
+
+    def _append_sync(self, event: str, agent_id: str, payload: dict) -> dict:
         # normalise so in-memory and reloaded entries hash identically
         payload = json.loads(json.dumps(payload, default=str))
         with self._lock:
-            prev = self._entries[-1]["hash"] if self._entries else GENESIS
-            body = {
-                "seq": len(self._entries),
-                "ts": round(self.clock(), 3),
-                "event": event,
-                "agent_id": agent_id,
-                "payload": payload,
-            }
-            entry = {**body, "prev_hash": prev, "hash": _digest(prev, body)}
-            self._entries.append(entry)
+            if self._write_failed:
+                raise RuntimeError("audit integrity is uncertain after a failed write")
             if self.path:
-                with open(self.path, "a", encoding="utf-8") as fh:
-                    fh.write(json.dumps(entry, default=str) + "\n")
+                with self._file_lock():
+                    self._entries, parse_error, _ = self._read_file_entries()
+                    valid, bad_seq = self._verify_entries(self._entries)
+                    if parse_error is not None:
+                        valid, bad_seq = False, parse_error
+                    if not valid:
+                        raise RuntimeError(f"audit integrity failure at sequence {bad_seq}")
+                    entry = self._create_entry(event, agent_id, payload)
+                    try:
+                        self._write_entry(entry)
+                    except OSError:
+                        self._write_failed = True
+                        raise
+                    self._entries.append(entry)
+                    return entry
+            valid, bad_seq = self._verify_entries(self._entries)
+            if not valid:
+                raise RuntimeError(f"audit integrity failure at sequence {bad_seq}")
+            entry = self._create_entry(event, agent_id, payload)
+            self._entries.append(entry)
             return entry
+
+    def _create_entry(self, event: str, agent_id: str, payload: dict) -> dict:
+        prev = self._entries[-1]["hash"] if self._entries else GENESIS
+        body = {
+            "seq": len(self._entries),
+            "ts": round(self.clock(), 3),
+            "event": event,
+            "agent_id": agent_id,
+            "payload": payload,
+        }
+        entry = {**body, "prev_hash": prev, "hash": _digest(prev, body)}
+        entry["hmac"] = _signature(self._hmac_key, entry)
+        return entry
+
+    def _write_entry(self, entry: dict) -> None:
+        with open(self.path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, default=str) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
 
     def entries(self, limit: int | None = None, agent_id: str | None = None) -> list[dict]:
         with self._lock:
-            rows = [e for e in self._entries if agent_id is None or e["agent_id"] == agent_id]
-        return rows[-limit:] if limit else rows
+            valid, bad_seq, entries, _ = self._verified_entries_locked()
+            if not valid:
+                raise RuntimeError(f"audit integrity failure at sequence {bad_seq}")
+            rows = [e for e in entries if agent_id is None or e["agent_id"] == agent_id]
+            selected = rows[-limit:] if limit else rows
+            return json.loads(json.dumps(selected))
+
+    def _verified_entries_locked(self) -> tuple[bool, int | None, list[dict], int]:
+        parse_error = None
+        count = len(self._entries)
+        if self.path:
+            with self._file_lock():
+                self._entries, parse_error, count = self._read_file_entries()
+        valid, bad_seq = self._verify_entries(self._entries)
+        if parse_error is not None:
+            valid, bad_seq = False, parse_error
+        if self._write_failed:
+            valid, bad_seq = False, len(self._entries)
+        return valid, bad_seq, self._entries, count
+
+    def _verify_entries(self, entries: list[dict]) -> tuple[bool, int | None]:
+        prev = GENESIS
+        for i, entry in enumerate(entries):
+            try:
+                if not isinstance(entry, dict):
+                    return False, i
+                body = {k: entry[k] for k in ("seq", "ts", "event", "agent_id", "payload")}
+                if not hmac.compare_digest(entry.get("hmac", ""), _signature(self._hmac_key, entry)):
+                    return False, i
+                if entry["seq"] != i or entry["prev_hash"] != prev or entry["hash"] != _digest(prev, body):
+                    return False, i
+            except (AttributeError, KeyError, TypeError, ValueError):
+                return False, i
+            prev = entry["hash"]
+        return True, None
+
+    def verify_with_count(self) -> tuple[bool, int | None, int]:
+        """Verify one disk snapshot and return its entry count."""
+        with self._lock:
+            valid, bad_seq, _, count = self._verified_entries_locked()
+            return valid, bad_seq, count
 
     def verify(self) -> tuple[bool, int | None]:
-        """Return (ok, first_bad_seq)."""
-        prev = GENESIS
-        with self._lock:
-            for i, e in enumerate(self._entries):
-                body = {k: e[k] for k in ("seq", "ts", "event", "agent_id", "payload")}
-                if e["seq"] != i or e["prev_hash"] != prev or e["hash"] != _digest(prev, body):
-                    return False, i
-                prev = e["hash"]
-        return True, None
+        """Return (ok, first_bad_seq), checking HMACs before the hash chain."""
+        valid, bad_seq, _ = self.verify_with_count()
+        return valid, bad_seq

@@ -117,6 +117,67 @@ class StateStore:
             ).scalar_one_or_none()
         return None if value is None else json.loads(value)
 
+    def claim_ticket_resolution(self, ticket_id: str, status: str, resolved_by: str,
+                                now: float) -> tuple[dict | None, str | None]:
+        if status not in {"approved", "denied"}:
+            raise ValueError(f"invalid resolution status: {status}")
+        with self._write() as connection:
+            row = connection.execute(
+                select(self.tickets.c.status, self.tickets.c.data)
+                .where(self.tickets.c.id == ticket_id)
+            ).one_or_none()
+            if row is None:
+                return None, "unknown ticket"
+            current_status, value = row
+            if current_status != "pending":
+                return None, f"ticket already {current_status}"
+
+            record = json.loads(value)
+            if status == "approved":
+                mandate_value = connection.execute(
+                    select(self.mandates.c.data)
+                    .where(self.mandates.c.agent_id == record["call"]["agent_id"])
+                ).scalar_one_or_none()
+                if mandate_value is None:
+                    return None, "mandate revoked; cannot approve"
+                mandate = json.loads(mandate_value)
+                if mandate.get("revoked"):
+                    return None, "mandate revoked; cannot approve"
+                expires_at = mandate.get("expires_at")
+                if expires_at is not None and expires_at < now:
+                    return None, "mandate expired; cannot approve"
+
+            record["status"], record["resolved_by"] = status, resolved_by
+            result = connection.execute(
+                update(self.tickets)
+                .where(self.tickets.c.id == ticket_id, self.tickets.c.status == "pending")
+                .values(status=status, data=json.dumps(record))
+            )
+            if result.rowcount != 1:
+                return None, "ticket resolution already claimed"
+            return record, None
+
+    def restore_pending_ticket(self, ticket_id: str, resolved_by: str) -> None:
+        with self._write() as connection:
+            row = connection.execute(
+                select(self.tickets.c.status, self.tickets.c.data)
+                .where(self.tickets.c.id == ticket_id)
+            ).one_or_none()
+            if row is None:
+                raise RuntimeError("ticket disappeared during resolution rollback")
+            status, value = row
+            record = json.loads(value)
+            if status not in {"approved", "denied"} or record.get("resolved_by") != resolved_by:
+                raise RuntimeError("ticket resolution changed before rollback")
+            record["status"], record["resolved_by"] = "pending", None
+            result = connection.execute(
+                update(self.tickets)
+                .where(self.tickets.c.id == ticket_id, self.tickets.c.status == status)
+                .values(status="pending", data=json.dumps(record))
+            )
+            if result.rowcount != 1:
+                raise RuntimeError("ticket resolution rollback was not applied")
+
     def policy_state(self, agent_id: str, now: float, window: float = 3600) -> tuple[Decimal, int]:
         with self.engine.connect() as connection:
             rows = connection.execute(

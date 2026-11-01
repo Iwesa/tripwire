@@ -8,7 +8,7 @@ Tripwire sits between any agent and PayPal and decides - deterministically - whe
 ## How it decides
 Hard gates (kill switch, expiry, tool scope) -> money rules (per-tx cap, budget, velocity, currency) -> payee rules
 (allowlist, lookalike detection) -> provenance/taint (did the payee come from untrusted content?) -> LLM judge
-(can only *tighten* a verdict, fails closed). Every step is written to a SHA-256 hash-chained audit log.
+(can only *tighten* a verdict, fails closed). Every step is written to an asynchronously persisted, HMAC-signed SHA-256 chain.
 Outcomes: **allow** (executes), **escalate** (human approval ticket), **deny** (HTTP 403).
 
 ## State
@@ -18,8 +18,9 @@ Budget and velocity are checked and reserved in one SQLite write transaction bef
 execution releases its reservation.
 
 ## Authentication
-Set distinct random values of at least 32 bytes for `TRIPWIRE_AGENT_API_KEY` and `TRIPWIRE_ADMIN_TOKEN` in
-`backend/.env`. The gateway requires `X-Agent-Key`; mandate, approval, state, and audit routes require
+Set distinct random values of at least 32 bytes for `TRIPWIRE_AGENT_API_KEY`, `TRIPWIRE_ADMIN_TOKEN`, and
+`TRIPWIRE_AUDIT_HMAC_KEY` in `backend/.env`. Keep the audit key stable across restarts; a persisted log requires it
+to verify existing entries. The gateway requires `X-Agent-Key`; mandate, approval, state, and audit routes require
 `X-Admin-Token`. Missing server credentials fail closed. Load `backend/.env` into both the API and demo-agent
 terminal environments before running the quickstart commands.
 
@@ -27,8 +28,8 @@ terminal environments before running the quickstart commands.
 ```bash
 cd backend && python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
 cp ../.env.example .env            # add sandbox creds; leave TRIPWIRE_MODE=dry to run offline
-# Generate independent secrets with `openssl rand -hex 32`, then load .env in this and the demo terminal.
-python3 -m unittest discover -s tests -t .      # 29 tests incl. the red-team evals
+# Generate three independent secrets with `openssl rand -hex 32`, then load .env in this and the demo terminal.
+python3 -m unittest discover -s tests -t .      # 45 tests incl. the red-team evals
 uvicorn app.main:app --reload                   # http://localhost:8000/docs
 # in other terminals, from repo root:
 python3 agent/evil_site.py
