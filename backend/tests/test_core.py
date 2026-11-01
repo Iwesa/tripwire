@@ -321,6 +321,41 @@ class AuditChain(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(AuditLog(p, hmac_key=self.hmac_key).verify(), (True, None))
             self.assertEqual(len(AuditLog(p, hmac_key=self.hmac_key).entries()), 3)
 
+    async def test_size_rotation_preserves_chain_across_reloads(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "audit.jsonl")
+            log = AuditLog(path, hmac_key=self.hmac_key, max_bytes=500)
+            for index in range(3):
+                await log.append("e", "a1", {"i": index})
+
+            reloaded = AuditLog(path, hmac_key=self.hmac_key, max_bytes=500)
+            self.assertTrue(os.path.exists(path + ".1"))
+            self.assertTrue(os.path.exists(path + ".2"))
+            for segment in (path, path + ".1", path + ".2"):
+                self.assertLessEqual(os.path.getsize(segment), 500)
+            self.assertEqual([entry["seq"] for entry in reloaded.entries()], [0, 1, 2])
+            self.assertEqual(reloaded.verify(), (True, None))
+            self.assertEqual(reloaded.verify_with_count(), (True, None, 3))
+
+    async def test_tampering_in_rotated_file_is_detected_and_blocks_append(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "audit.jsonl")
+            log = AuditLog(path, hmac_key=self.hmac_key, max_bytes=500)
+            for index in range(3):
+                await log.append("e", "a1", {"i": index})
+
+            archived_path = path + ".2"
+            with open(archived_path, encoding="utf-8") as fh:
+                entry = json.loads(fh.readline())
+            entry["payload"]["i"] = 99
+            with open(archived_path, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry) + "\n")
+
+            reloaded = AuditLog(path, hmac_key=self.hmac_key, max_bytes=500)
+            self.assertEqual(reloaded.verify(), (False, 0))
+            with self.assertRaisesRegex(RuntimeError, "integrity"):
+                await reloaded.append("e", "a1", {"i": 3})
+
     async def test_file_tampering_detected_by_hmac(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "audit.jsonl")

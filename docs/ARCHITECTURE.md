@@ -47,6 +47,8 @@ Tripwire is a harness twice over, and that is the project's thesis:
 - `sources` are reported by the agent SDK. A fully compromised agent could omit them; deterministic rules still hold.
 - SQLite persists mandates, tickets, spend, and velocity state across restarts. SQLite serializes write transactions
   database-wide; higher-concurrency deployments should use a database with row-level locking.
-- Audit HMACs detect modification of signed entries, but truncating or rolling back the entire file requires an
-  external checkpoint or remote anchor to detect.
+- Persisted audit logs rotate into numbered JSONL segments before an append would exceed the 10 MiB size threshold (a
+  single oversized event may exceed it). Verification checks the continuous HMAC/hash chain across all segments;
+  segments are retained indefinitely. HMACs detect modification or partial truncation, but rolling back the entire set
+  requires an external checkpoint or remote anchor to detect.
 - Prototype for the sandbox. Not a production payment-control product.

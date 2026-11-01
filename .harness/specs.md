@@ -17,6 +17,6 @@
 [x] Verify `backend/tests/test_redteam.py` remains green and catches advanced obfuscation techniques.
 
 ## Unit 4: Audit Log Scalability
-[ ] Plan tests for audit log rotation or DB storage.
-[ ] Update `backend/app/audit.py` to implement file rotation (e.g., daily or size-based rotation) to prevent `.jsonl` I/O bottlenecks.
-[ ] *Alternative to rotation:* Migrate the hash-chained audit ledger entirely into the new persistent layer defined in `backend/app/storage.py`. Ensure `verify()` logic still holds cryptographic integrity.
+[x] Plan tests for audit log rotation, chain verification, and tamper detection.
+[x] Update `backend/app/audit.py` to rotate persisted JSONL files by size while preserving chain verification across archived segments.
+Database migration alternative not selected; size-based JSONL rotation was chosen.

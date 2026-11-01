@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from typing import Callable
 
 GENESIS = "0" * 64
+DEFAULT_MAX_BYTES = 10 * 1024 * 1024
 _FILE_LOCKS: dict[str, threading.Lock] = {}
 _FILE_LOCKS_GUARD = threading.Lock()
 
@@ -39,8 +40,11 @@ def _process_file_lock(path: str) -> threading.Lock:
 
 class AuditLog:
     def __init__(self, path: str | None = None, clock: Callable[[], float] = time.time,
-                 hmac_key: str | bytes | None = None):
+                 hmac_key: str | bytes | None = None, max_bytes: int = DEFAULT_MAX_BYTES):
+        if max_bytes <= 0:
+            raise ValueError("audit rotation size must be greater than zero")
         self.path = path
+        self.max_bytes = max_bytes
         self.clock = clock
         self._lock = threading.Lock()
         self._file_thread_lock = _process_file_lock(path) if path else None
@@ -94,21 +98,38 @@ class AuditLog:
 
     def _read_file_entries(self) -> tuple[list[dict], int | None, int]:
         entries = []
-        if self.path is None or not os.path.exists(self.path):
+        if self.path is None:
             return entries, None, 0
         parse_error = None
         count = 0
-        with open(self.path, "rb") as fh:
-            for line in fh:
-                if not line.strip():
-                    continue
-                count += 1
-                try:
-                    entries.append(json.loads(line))
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    if parse_error is None:
-                        parse_error = count - 1
+        for file_path in self._audit_file_paths():
+            with open(file_path, "rb") as fh:
+                for line in fh:
+                    if not line.strip():
+                        continue
+                    count += 1
+                    try:
+                        entries.append(json.loads(line))
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        if parse_error is None:
+                            parse_error = count - 1
         return entries, parse_error, count
+
+    def _audit_file_paths(self) -> list[str]:
+        if self.path is None:
+            return []
+        directory = os.path.dirname(self.path) or "."
+        prefix = os.path.basename(self.path) + "."
+        archived = []
+        for name in os.listdir(directory):
+            if not name.startswith(prefix):
+                continue
+            suffix = name[len(prefix):]
+            if suffix.isdigit():
+                archived.append((int(suffix), os.path.join(directory, name)))
+        return [
+            file_path for _, file_path in sorted(archived, reverse=True)
+        ] + ([self.path] if os.path.exists(self.path) else [])
 
     async def append(self, event: str, agent_id: str, payload: dict) -> dict:
         return await asyncio.to_thread(self._append_sync, event, agent_id, payload)
@@ -156,8 +177,16 @@ class AuditLog:
         return entry
 
     def _write_entry(self, entry: dict) -> None:
+        serialized = json.dumps(entry, default=str) + "\n"
+        if os.path.exists(self.path) and os.path.getsize(self.path):
+            if os.path.getsize(self.path) + len(serialized.encode("utf-8")) > self.max_bytes:
+                archived = self._audit_file_paths()[:-1]
+                for archived_path in archived:
+                    suffix = int(archived_path.rsplit(".", 1)[1])
+                    os.replace(archived_path, f"{self.path}.{suffix + 1}")
+                os.replace(self.path, f"{self.path}.1")
         with open(self.path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry, default=str) + "\n")
+            fh.write(serialized)
             fh.flush()
             os.fsync(fh.fileno())
 
