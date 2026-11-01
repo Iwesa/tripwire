@@ -44,7 +44,7 @@ cd backend && python3 -m venv .venv && . .venv/bin/activate && pip install -r re
 cp ../.env.example .env            # add sandbox creds; leave TRIPWIRE_MODE=dry to run offline
 # Generate three independent secrets with `openssl rand -hex 32`, then load .env in this and the demo terminal.
 python3 -m unittest discover -s tests -t .      # 63 tests incl. the red-team evals
-uvicorn app.main:app --reload                   # http://localhost:8000/docs
+uvicorn app.main:create_app --factory --reload                   # http://localhost:8000/docs
 # in other terminals, from repo root:
 python3 agent/evil_site.py
 python3 agent/demo_agent.py setup

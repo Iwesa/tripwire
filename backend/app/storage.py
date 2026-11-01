@@ -3,19 +3,27 @@ from __future__ import annotations
 
 import atexit
 import json
+import os
 from contextlib import contextmanager
 from decimal import Decimal
 from typing import Iterator
 
 from sqlalchemy import Column, Float, Integer, MetaData, String, Table, Text, create_engine, delete, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.engine import Connection, Engine, make_url
 
 from .models import MONEY_MOVING, Mandate, ToolCall, Verdict
 
 
 class StateStore:
     def __init__(self, database_url: str):
+        parsed = make_url(database_url)
+        if parsed.get_backend_name() == "sqlite":
+            database = parsed.database
+            if database and database not in {":memory:", "file::memory:?cache=shared"}:
+                directory = os.path.dirname(database)
+                if directory:
+                    os.makedirs(directory, exist_ok=True)
         self.engine: Engine = create_engine(
             database_url,
             connect_args={"check_same_thread": False, "timeout": 30},

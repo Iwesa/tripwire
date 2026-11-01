@@ -1,7 +1,4 @@
-"""Tripwire HTTP API. Thin by design: all decisions live in policy.py (unit-tested).
-
-NOTE: written without FastAPI available in the authoring sandbox - run
-`uvicorn app.main:app --reload` and hit /docs on Day 1 to confirm it boots.
+"""Tripwire HTTP API. Thin by design: all decisions live in policy.py.
 """
 from __future__ import annotations
 
@@ -453,4 +450,5 @@ def create_app(executor=None, judge=None, audit: AuditLog | None = None, clock=t
     return app
 
 
-app = create_app()
+if __name__ == "__main__":
+    app = create_app()

@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import os
 import tempfile
 import threading
 import unittest
@@ -158,6 +159,37 @@ class PersistentState(unittest.TestCase):
         for name in ("health", "list_mandates", "state", "approvals", "audit_list", "audit_verify", "tool_call"):
             with self.subTest(endpoint=name):
                 self.assertTrue(inspect.iscoroutinefunction(endpoints[name]))
+
+    def test_nested_database_and_audit_paths_are_created(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nested = os.path.join(directory, "state", "deep")
+            db_url = f"sqlite:///{os.path.join(nested, 'tripwire.db')}"
+            audit_path = os.path.join(nested, "logs", "audit.jsonl")
+            with patch.dict(
+                os.environ,
+                {
+                    "TRIPWIRE_AUDIT_PATH": audit_path,
+                    "TRIPWIRE_AUDIT_HMAC_KEY": "audit-key-" + "a" * 48,
+                },
+                clear=False,
+            ):
+                app = create_app(
+                    database_url=db_url,
+                    agent_api_key="agent-key-" + "a" * 48,
+                    admin_token="admin-token-" + "b" * 48,
+                )
+                invoke(
+                    app,
+                    "/mandates",
+                    MandateIn(**mandate_payload()),
+                    method="POST",
+                )
+                app.state.store.dispose()
+
+            self.assertTrue(os.path.isdir(os.path.dirname(db_url.replace("sqlite:///", ""))))
+            self.assertTrue(os.path.isdir(os.path.dirname(audit_path)))
+            self.assertTrue(os.path.exists(db_url.replace("sqlite:///", "")))
+            self.assertTrue(os.path.exists(audit_path))
 
     def test_gateway_awaits_async_executor(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:

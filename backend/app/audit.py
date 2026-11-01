@@ -44,6 +44,10 @@ class AuditLog:
         if max_bytes <= 0:
             raise ValueError("audit rotation size must be greater than zero")
         self.path = path
+        if self.path:
+            directory = os.path.dirname(self.path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
         self.max_bytes = max_bytes
         self.clock = clock
         self._lock = threading.Lock()
