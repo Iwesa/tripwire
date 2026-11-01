@@ -14,8 +14,9 @@ is written to an asynchronously persisted, HMAC-signed SHA-256 chain.
 Outcomes: **allow** (executes), **escalate** (human approval ticket), **deny** (HTTP 403).
 
 Prompt-injection detection normalizes zero-width characters and inspects decodable Base64 text. Set `LAKERA_API_KEY`
-to enable Lakera Guard classification; source excerpts are sent to Lakera when enabled, and a classifier error escalates
-the payment. Without a key, the local normalization and pattern checks still run, but are heuristic and can be evaded.
+to enable Lakera Guard classification; the original excerpt and normalized/decoded variants are sent to Lakera when
+enabled, and a classifier error escalates the payment. Without a key, the local normalization and pattern checks still
+run, but are heuristic and can be evaded.
 Payee lookalikes are compared using cosine similarity over normalized character n-gram vectors; this targets spelling
 variants, not conceptual aliases.
 
@@ -39,7 +40,7 @@ The gateway also enforces a limit of 50 requests per minute per client IP and re
 cd backend && python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
 cp ../.env.example .env            # add sandbox creds; leave TRIPWIRE_MODE=dry to run offline
 # Generate three independent secrets with `openssl rand -hex 32`, then load .env in this and the demo terminal.
-python3 -m unittest discover -s tests -t .      # 60 tests incl. the red-team evals
+python3 -m unittest discover -s tests -t .      # 61 tests incl. the red-team evals
 uvicorn app.main:app --reload                   # http://localhost:8000/docs
 # in other terminals, from repo root:
 python3 agent/evil_site.py

@@ -36,9 +36,10 @@ Tripwire is a harness twice over, and that is the project's thesis:
 
 ## Known limitations (say these in the README; judges respect honesty)
 - Prompt-injection detection normalizes zero-width characters and decodes Base64 before applying local heuristics.
-  Configuring `LAKERA_API_KEY` adds Lakera Guard classification; when it is not configured, detection remains heuristic
-  and evadable. Classifier errors escalate affected payments. The *decisive* controls (caps, allowlist, budget, velocity,
-  kill switch) do not depend on detecting the attack, which is the point.
+  Configuring `LAKERA_API_KEY` also sends the original excerpt plus normalized and decoded variants to Lakera Guard
+  classification; without it, detection remains heuristic and evadable. Classifier errors escalate affected payments.
+  The *decisive* controls (caps, allowlist, budget, velocity, kill switch) do not depend on detecting the attack, which
+  is the point.
 - Payee lookalikes use cosine similarity over normalized character n-gram vectors. This catches spelling variants, not
   conceptually related names or paraphrased payees; the allowlist remains decisive.
 - Taint tracking is string provenance (payee/amount echoed from untrusted text). A paraphrased or encoded payee evades it;

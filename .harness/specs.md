@@ -12,9 +12,9 @@
 [x] Update `backend/app/main.py` to strictly enforce the authentication logic currently evaluated in `backend/tests/test_auth.py`. Use FastAPI `Depends()` for the API key/token.
 
 ## Unit 3: Advanced Injection Defense
-[ ] Plan tests verifying evasion defense against zero-width spaces and base64 payloads.
-[ ] Refactor `backend/app/injection.py` to replace regex heuristics with an ML-based text classification pipeline (e.g., local HuggingFace `pipeline("text-classification")` or Lakera Guard API).
-[ ] Verify `backend/tests/test_redteam.py` remains green and catches advanced obfuscation techniques.
+[x] Plan tests verifying evasion defense against zero-width spaces and base64 payloads.
+[x] Refactor `backend/app/injection.py` to prepare normalized and decoded text for the Lakera Guard ML classifier.
+[x] Verify `backend/tests/test_redteam.py` remains green and catches advanced obfuscation techniques.
 
 ## Unit 4: Audit Log Scalability
 [ ] Plan tests for audit log rotation or DB storage.
