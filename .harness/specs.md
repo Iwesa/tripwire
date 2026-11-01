@@ -16,6 +16,6 @@
 [x] **False Positive Compound Triggers:** Modify the LLM judge/policy logic: An injection escalation should only fire if an injection phrase co-occurs with a tainted payee or amount (e.g., `(urgency OR override) AND tainted_data`).
 
 ## Unit 4: Evals, Coverage & Scale
-[ ] **Audit Caching:** Update `AuditLog` in `audit.py`. Cache the `head_hash` in memory/SQLite. Upon appending, only hash the new entry against the known head instead of re-reading the entire file.
-[ ] **Benign Evals:** Add at least 30 new realistic benign invoice phrasings to `backend/evals/redteam_cases.json`.
-[ ] **Necessity Test Coverage:** Update `test_every_rule_is_necessary` in `test_redteam.py` to ensure all 20 rules (including the 6 currently missing) are mapped to test cases.
+[x] **Audit Caching:** Update `AuditLog` in `audit.py`. Cache the `head_hash` in memory/SQLite. Upon appending, only hash the new entry against the known head instead of re-reading the entire file.
+[x] **Benign Evals:** Add at least 30 new realistic benign invoice phrasings to `backend/evals/redteam_cases.json`.
+[x] **Necessity Test Coverage:** Update `test_every_rule_is_necessary` in `test_redteam.py` to ensure all 20 rules (including the 6 currently missing) are mapped to test cases.

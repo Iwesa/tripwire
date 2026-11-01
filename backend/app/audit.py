@@ -65,9 +65,11 @@ class AuditLog:
             raise ValueError("audit HMAC key must be at least 32 bytes")
         self._hmac_key = hmac_key
         self._entries: list[dict] = []
+        self._head_hash = GENESIS
+        self._file_state: tuple[int, int] | None = None
         if path and os.path.exists(path):
             with self._file_lock():
-                self._entries, _, _ = self._read_file_entries()
+                self._refresh_file_state_locked()
 
     @contextmanager
     def _file_lock(self):
@@ -146,10 +148,8 @@ class AuditLog:
                 raise RuntimeError("audit integrity is uncertain after a failed write")
             if self.path:
                 with self._file_lock():
-                    self._entries, parse_error, _ = self._read_file_entries()
+                    self._refresh_file_state_locked(force=False)
                     valid, bad_seq = self._verify_entries(self._entries)
-                    if parse_error is not None:
-                        valid, bad_seq = False, parse_error
                     if not valid:
                         raise RuntimeError(f"audit integrity failure at sequence {bad_seq}")
                     entry = self._create_entry(event, agent_id, payload)
@@ -159,16 +159,22 @@ class AuditLog:
                         self._write_failed = True
                         raise
                     self._entries.append(entry)
+                    self._head_hash = entry["hash"]
+                    self._file_state = (
+                        os.path.getmtime(self.path),
+                        os.path.getsize(self.path),
+                    )
                     return entry
             valid, bad_seq = self._verify_entries(self._entries)
             if not valid:
                 raise RuntimeError(f"audit integrity failure at sequence {bad_seq}")
             entry = self._create_entry(event, agent_id, payload)
             self._entries.append(entry)
+            self._head_hash = entry["hash"]
             return entry
 
     def _create_entry(self, event: str, agent_id: str, payload: dict) -> dict:
-        prev = self._entries[-1]["hash"] if self._entries else GENESIS
+        prev = self._head_hash
         body = {
             "seq": len(self._entries),
             "ts": round(self.clock(), 3),
@@ -203,12 +209,35 @@ class AuditLog:
             selected = rows[-limit:] if limit else rows
             return json.loads(json.dumps(selected))
 
+    def _refresh_file_state_locked(self, *, force: bool = False) -> None:
+        if self.path is None:
+            return
+        try:
+            current_state = (os.path.getmtime(self.path), os.path.getsize(self.path))
+        except FileNotFoundError:
+            self._entries = []
+            self._head_hash = GENESIS
+            self._file_state = None
+            return
+        if not force and self._file_state == current_state:
+            return
+        self._entries, parse_error, _ = self._read_file_entries()
+        if self._entries:
+            self._head_hash = self._entries[-1]["hash"]
+        else:
+            self._head_hash = GENESIS
+        self._file_state = current_state
+        self._parse_error = parse_error
+
     def _verified_entries_locked(self) -> tuple[bool, int | None, list[dict], int]:
         parse_error = None
         count = len(self._entries)
         if self.path:
             with self._file_lock():
-                self._entries, parse_error, count = self._read_file_entries()
+                self._refresh_file_state_locked(force=True)
+                parse_error = getattr(self, "_parse_error", None)
+                count = len(self._entries)
+        self._head_hash = self._entries[-1]["hash"] if self._entries else GENESIS
         valid, bad_seq = self._verify_entries(self._entries)
         if parse_error is not None:
             valid, bad_seq = False, parse_error

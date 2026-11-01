@@ -537,6 +537,17 @@ class AuditChain(unittest.IsolatedAsyncioTestCase):
                     release.set()
                 await append_task
 
+    async def test_append_reuses_cached_head_hash_without_reloading_entries(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "audit.jsonl")
+            log = AuditLog(path, hmac_key=self.hmac_key)
+            await log.append("e", "a1", {"i": 0})
+            self.assertTrue(hasattr(log, "_head_hash"))
+            self.assertEqual(log._head_hash, log._entries[-1]["hash"])
+            with patch.object(log, "_read_file_entries", side_effect=AssertionError("re-read not allowed")):
+                await log.append("e", "a1", {"i": 1})
+            self.assertEqual(log.verify(), (True, None))
+
 
 if __name__ == "__main__":
     unittest.main()
