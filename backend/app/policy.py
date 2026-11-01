@@ -8,15 +8,19 @@ Design rules (see CLAUDE.md invariants):
 """
 from __future__ import annotations
 
-import difflib
+import base64
+import binascii
+import math
 import re
 import time
+import unicodedata
+from collections import Counter
 from decimal import Decimal
 from typing import Callable
 
 from .models import MONEY_MOVING, Decision, Finding, Mandate, ToolCall, Verdict
 
-# --- injection heuristics -------------------------------------------------
+# --- injection detection --------------------------------------------------
 INJECTION_PATTERNS: dict[str, re.Pattern] = {
     name: re.compile(rx, re.I | re.S)
     for name, rx in {
@@ -28,36 +32,103 @@ INJECTION_PATTERNS: dict[str, re.Pattern] = {
     }.items()
 }
 
+_BASE64_TOKEN = re.compile(r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{16,}={0,2}(?![A-Za-z0-9+/_-])")
 
-def injection_signals(text: str) -> list[str]:
-    return [name for name, rx in INJECTION_PATTERNS.items() if rx.search(text or "")]
+
+def _normalize_untrusted_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text)
+    return "".join(char for char in normalized if unicodedata.category(char) != "Cf")
+
+
+def _separated_untrusted_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text)
+    return "".join(" " if unicodedata.category(char) == "Cf" else char for char in normalized)
+
+
+def _decoded_texts(text: str) -> list[str]:
+    decoded = []
+    for match in _BASE64_TOKEN.finditer(text):
+        token = match.group(0)
+        try:
+            raw = base64.b64decode(
+                token + "=" * (-len(token) % 4),
+                altchars=b"-_",
+                validate=True,
+            )
+            candidate = raw.decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError, ValueError):
+            continue
+        printable = sum(char.isprintable() or char.isspace() for char in candidate)
+        if candidate and printable / len(candidate) >= 0.85:
+            decoded.append(candidate)
+        if len(decoded) == 32:
+            break
+    return decoded
+
+
+def injection_signals(text: str, classifier: Callable[[str], bool] | None = None) -> list[str]:
+    """Detect known injection phrases after normalization and optional classification."""
+    source = str(text or "")
+    normalized = _normalize_untrusted_text(source)
+    variants = [
+        normalized,
+        _separated_untrusted_text(source),
+        *(_normalize_untrusted_text(item) for item in _decoded_texts(normalized)),
+    ]
+    signals = [name for name, rx in INJECTION_PATTERNS.items() if any(rx.search(item) for item in variants)]
+    if classifier is not None:
+        if classifier("\n".join(variants)):
+            signals.append("prompt_injection")
+    return signals
 
 
 # --- lookalike payee detection -------------------------------------------
 _HOMOGLYPHS = str.maketrans({"1": "l", "0": "o", "5": "s", "3": "e", "$": "s"})
+_LOOKALIKE_THRESHOLD = 0.85
 
 
 def _norm(s: str) -> str:
     return s.lower().translate(_HOMOGLYPHS).replace("rn", "m").replace("vv", "w")
 
 
+def _character_vector(value: str) -> Counter:
+    return Counter(
+        (size, value[index : index + size])
+        for size in (2, 3)
+        for index in range(len(value) - size + 1)
+    )
+
+
+def _cosine_similarity(left: Counter, right: Counter) -> float:
+    if not left or not right:
+        return 0.0
+    dot = sum(left[gram] * right[gram] for gram in left.keys() & right.keys())
+    left_norm = math.sqrt(sum(weight * weight for weight in left.values()))
+    right_norm = math.sqrt(sum(weight * weight for weight in right.values()))
+    return dot / (left_norm * right_norm)
+
+
 def lookalike_of(payee: str, allowed) -> str | None:
     """Return the allowlisted payee this one imitates, if any."""
-    p = payee.lower()
+    p = _norm(payee)
+    p_vector = _character_vector(p)
     for a in allowed:
-        if p == a.lower():
+        if payee.lower() == a.lower():
             continue
-        if _norm(p) == _norm(a) or difflib.SequenceMatcher(None, _norm(p), _norm(a)).ratio() >= 0.88:
+        candidate = _norm(a)
+        if p == candidate or _cosine_similarity(p_vector, _character_vector(candidate)) >= _LOOKALIKE_THRESHOLD:
             return a
     return None
 
 
 class PolicyEngine:
     def __init__(self, judge=None, clock: Callable[[], float] = time.time,
-                 disabled_rules: frozenset = frozenset(), state_store=None):
+                 disabled_rules: frozenset = frozenset(), state_store=None,
+                 injection_classifier: Callable[[str], bool] | None = None):
         self.judge = judge
         self.clock = clock
         self.state_store = state_store
+        self.injection_classifier = injection_classifier
         # Test-only: lets the eval suite prove every rule is necessary (see test_every_rule_is_necessary).
         self.disabled_rules = disabled_rules
         self._spent: dict[str, Decimal] = {}
@@ -185,7 +256,15 @@ class PolicyEngine:
             if s.trust != "untrusted":
                 continue
             ex = (s.excerpt or "").lower()
-            signals = injection_signals(s.excerpt)
+            try:
+                signals = injection_signals(s.excerpt, self.injection_classifier)
+            except Exception as error:  # classifier outages must not silently allow untrusted input
+                signals = []
+                add(
+                    "injection_classifier_error",
+                    Decision.ESCALATE,
+                    f"injection classifier unavailable, failing closed: {type(error).__name__}",
+                )
             payee_tainted = bool(c.payee) and c.payee.lower() in ex
             amount_tainted = c.amount is not None and str(c.amount) in ex
             allowlisted = bool(c.payee) and c.payee.lower() in m.allowed_payees

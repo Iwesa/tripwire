@@ -33,8 +33,12 @@ Tripwire is a harness twice over, and that is the project's thesis:
 | Observability | Async append to an HMAC-signed SHA-256 chain, verify endpoint, dashboard |
 
 ## Known limitations (say these in the README; judges respect honesty)
-- Injection patterns are heuristics and evadable. The *decisive* controls (caps, allowlist, budget, velocity, kill switch)
-  do not depend on detecting the attack, which is the point.
+- Prompt-injection detection normalizes zero-width characters and decodes Base64 before applying local heuristics.
+  Configuring `LAKERA_API_KEY` adds Lakera Guard classification; when it is not configured, detection remains heuristic
+  and evadable. Classifier errors escalate affected payments. The *decisive* controls (caps, allowlist, budget, velocity,
+  kill switch) do not depend on detecting the attack, which is the point.
+- Payee lookalikes use cosine similarity over normalized character n-gram vectors. This catches spelling variants, not
+  conceptually related names or paraphrased payees; the allowlist remains decisive.
 - Taint tracking is string provenance (payee/amount echoed from untrusted text). A paraphrased or encoded payee evades it;
   the allowlist still blocks it.
 - `sources` are reported by the agent SDK. A fully compromised agent could omit them; deterministic rules still hold.

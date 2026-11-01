@@ -7,9 +7,16 @@ Tripwire sits between any agent and PayPal and decides - deterministically - whe
 
 ## How it decides
 Hard gates (kill switch, expiry, tool scope) -> money rules (per-tx cap, budget, velocity, currency) -> payee rules
-(allowlist, lookalike detection) -> provenance/taint (did the payee come from untrusted content?) -> LLM judge
+(allowlist, vector-based lookalike detection) -> provenance/taint (did the payee come from untrusted content?) ->
+prompt-injection detection -> LLM judge
 (can only *tighten* a verdict, fails closed). Every step is written to an asynchronously persisted, HMAC-signed SHA-256 chain.
 Outcomes: **allow** (executes), **escalate** (human approval ticket), **deny** (HTTP 403).
+
+Prompt-injection detection normalizes zero-width characters and inspects decodable Base64 text. Set `LAKERA_API_KEY`
+to enable Lakera Guard classification; source excerpts are sent to Lakera when enabled, and a classifier error escalates
+the payment. Without a key, the local normalization and pattern checks still run, but are heuristic and can be evaded.
+Payee lookalikes are compared using cosine similarity over normalized character n-gram vectors; this targets spelling
+variants, not conceptual aliases.
 
 ## State
 Mandates, approval tickets, spend totals, and velocity events persist in SQLite. The default database is
@@ -29,7 +36,7 @@ terminal environments before running the quickstart commands.
 cd backend && python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
 cp ../.env.example .env            # add sandbox creds; leave TRIPWIRE_MODE=dry to run offline
 # Generate three independent secrets with `openssl rand -hex 32`, then load .env in this and the demo terminal.
-python3 -m unittest discover -s tests -t .      # 45 tests incl. the red-team evals
+python3 -m unittest discover -s tests -t .      # 50 tests incl. the red-team evals
 uvicorn app.main:app --reload                   # http://localhost:8000/docs
 # in other terminals, from repo root:
 python3 agent/evil_site.py

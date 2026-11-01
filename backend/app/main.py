@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from .audit import AuditLog
+from .injection import LakeraGuardClassifier
 from .judge import LLMJudge, NullJudge
 from .models import Decision, Finding, ToolCall, Verdict, call_from_dict, mandate_from_dict
 from .paypal import DryRunExecutor, PayPalClient, PayPalError
@@ -180,7 +181,17 @@ def create_app(executor=None, judge=None, audit: AuditLog | None = None, clock=t
     audit = audit or AuditLog(os.getenv("TRIPWIRE_AUDIT_PATH"))
     executor = executor or _default_executor()
     store = StateStore(database_url or os.getenv("TRIPWIRE_DATABASE_URL", "sqlite:///tripwire.db"))
-    engine = PolicyEngine(judge=judge, clock=clock, state_store=store)
+    injection_classifier = (
+        LakeraGuardClassifier(os.environ["LAKERA_API_KEY"])
+        if os.getenv("LAKERA_API_KEY")
+        else None
+    )
+    engine = PolicyEngine(
+        judge=judge,
+        clock=clock,
+        state_store=store,
+        injection_classifier=injection_classifier,
+    )
 
     app = FastAPI(title="Tripwire", description="Spend firewall for AI agents (PayPal sandbox)")
     app.add_middleware(
