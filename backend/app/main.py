@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import hmac
 import inspect
@@ -10,13 +11,14 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from typing import Literal
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -24,7 +26,7 @@ from slowapi.util import get_remote_address
 from .audit import AuditLog
 from .injection import LakeraGuardClassifier
 from .judge import LLMJudge, NullJudge
-from .models import Decision, Finding, ToolCall, Verdict, call_from_dict, mandate_from_dict
+from .models import Decision, Finding, Source, ToolCall, Verdict, call_from_dict, mandate_from_dict
 from .paypal import DryRunExecutor, PayPalClient, PayPalError
 from .policy import PolicyEngine
 from .storage import StateStore
@@ -48,18 +50,37 @@ class MandateIn(BaseModel):
     allowed_payees: list[str] = []
     payee_mode: Literal["allowlist", "approve_new"] = "allowlist"
     max_tx_per_hour: int = 5
+    trusted_origins: list[str] = []
     ttl_seconds: int | None = 3600
 
 
 class ToolCallIn(BaseModel):
     agent_id: str
     tool: str
-    amount: str | None = None
+    amount: Decimal | None = None
     currency: str = "USD"
     payee: str | None = None
     args: dict = {}
     sources: list[SourceIn] = []
     agent_note: str = ""
+
+    @field_validator("amount")
+    @classmethod
+    def validate_amount(cls, value):
+        if value is None:
+            return None
+        try:
+            amount = Decimal(str(value))
+        except InvalidOperation as exc:
+            raise ValueError(f"invalid amount: {value!r}") from exc
+        if not amount.is_finite():
+            raise ValueError(f"non-finite amount: {value!r}")
+        if amount <= 0:
+            raise ValueError(f"amount must be > 0: {value!r}")
+        quantized = amount.quantize(Decimal("0.01"))
+        if amount != quantized:
+            raise ValueError(f"amount must be quantized to two decimal places: {value!r}")
+        return quantized
 
 
 class ApprovalIn(BaseModel):
@@ -117,6 +138,23 @@ def _configured_secret(name: str, supplied: str | None) -> str | None:
     if len(value.encode("utf-8")) < 32:
         raise ValueError(f"{name} must be at least 32 bytes")
     return value
+
+
+def _canonical_origin(value: str | None) -> str | None:
+    if value is None:
+        return None
+    trimmed = value.strip()
+    if not trimmed:
+        return None
+    parts = urlsplit(trimmed)
+    if not parts.scheme or not parts.netloc:
+        return trimmed.rstrip("/")
+    return f"{parts.scheme.lower()}://{parts.netloc.lower()}"
+
+
+def agent_id_from_key(agent_key: str) -> str:
+    raw = hashlib.sha256(agent_key.encode("utf-8")).hexdigest()
+    return f"agent-{raw[:32]}"
 
 
 _AUDIT_SECRET_KEY_PARTS = (
@@ -317,6 +355,10 @@ def create_app(executor=None, judge=None, audit: AuditLog | None = None, clock=t
     async def create_mandate(body: MandateIn):
         data = body.model_dump()
         ttl = data.pop("ttl_seconds")
+        trusted_origins = [
+            origin for origin in (_canonical_origin(origin) for origin in data.get("trusted_origins", [])) if origin
+        ]
+        data["trusted_origins"] = trusted_origins
         data["expires_at"] = clock() + ttl if ttl else None
         m = _parse_dict(data, mandate_from_dict)
         await asyncio.to_thread(store.save_mandate, m.to_dict())
@@ -361,10 +403,26 @@ def create_app(executor=None, judge=None, audit: AuditLog | None = None, clock=t
     @limiter.limit("50/minute")
     async def tool_call(request: Request, body: ToolCallIn):
         call = _parse(body, call_from_dict)
+        request_agent_id = agent_id_from_key(request.headers.get("X-Agent-Key", ""))
+        call.agent_id = request_agent_id
         data = await asyncio.to_thread(store.get_mandate, call.agent_id)
+        if data is None and body.agent_id and body.agent_id != request_agent_id:
+            legacy_id = body.agent_id
+            data = await asyncio.to_thread(store.get_mandate, legacy_id)
+            if data is not None:
+                call.agent_id = legacy_id
         if data is None:
             raise HTTPException(404, "no mandate for this agent")
         m = _parse_dict(data, mandate_from_dict)
+        trusted = set(m.trusted_origins)
+        call.sources = [
+            Source(
+                url=source.url,
+                trust="trusted" if _canonical_origin(source.url) in trusted else "untrusted",
+                excerpt=source.excerpt,
+            )
+            for source in call.sources
+        ]
         verdict, reservation_id = await engine.evaluate_and_reserve_async(
             m, call, reserve_escalations=True
         )

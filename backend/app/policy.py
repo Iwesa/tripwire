@@ -348,8 +348,14 @@ class PolicyEngine:
         if c.amount is None:
             add("amount_missing", Decision.DENY, "money-moving call without a verifiable amount")
             return
+        if not c.amount.is_finite():
+            add("amount_invalid", Decision.DENY, f"non-finite amount {c.amount}")
+            return
         if c.amount <= 0:
             add("amount_invalid", Decision.DENY, f"non-positive amount {c.amount}")
+            return
+        if c.amount != c.amount.quantize(Decimal("0.01")):
+            add("amount_invalid", Decision.DENY, f"amount must be quantized to 2 decimal places: {c.amount}")
             return
         if c.currency != m.currency:
             add("currency_mismatch", Decision.DENY, f"{c.currency} != mandate currency {m.currency}")

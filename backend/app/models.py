@@ -51,6 +51,7 @@ class Mandate:
     allowed_payees: frozenset = frozenset()
     payee_mode: str = "allowlist"  # "allowlist" (deny new) | "approve_new" (escalate new)
     max_tx_per_hour: int = 5
+    trusted_origins: frozenset = frozenset()
     expires_at: float | None = None
     revoked: bool = False
 
@@ -66,6 +67,7 @@ class Mandate:
             "allowed_payees": sorted(self.allowed_payees),
             "payee_mode": self.payee_mode,
             "max_tx_per_hour": self.max_tx_per_hour,
+            "trusted_origins": sorted(self.trusted_origins),
             "expires_at": self.expires_at,
             "revoked": self.revoked,
         }
@@ -120,9 +122,15 @@ def _money(v) -> Decimal | None:
     if v is None:
         return None
     try:
-        return Decimal(str(v))
+        value = Decimal(str(v))
     except InvalidOperation as e:
         raise ValueError(f"invalid amount: {v!r}") from e
+    if not value.is_finite():
+        raise ValueError(f"non-finite amount: {v!r}")
+    quantized = value.quantize(Decimal("0.01"))
+    if value != quantized:
+        raise ValueError(f"amount must be quantized to 2 decimal places: {v!r}")
+    return quantized
 
 
 def mandate_from_dict(d: dict) -> Mandate:
@@ -137,6 +145,7 @@ def mandate_from_dict(d: dict) -> Mandate:
         allowed_payees=frozenset(p.lower() for p in d.get("allowed_payees", [])),
         payee_mode=d.get("payee_mode", "allowlist"),
         max_tx_per_hour=int(d.get("max_tx_per_hour", 5)),
+        trusted_origins=frozenset(str(origin).strip() for origin in d.get("trusted_origins", [])),
         expires_at=d.get("expires_at"),
         revoked=bool(d.get("revoked", False)),
     )

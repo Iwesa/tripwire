@@ -1,22 +1,21 @@
-# Hardening Specs for Tripwire - Phase 2 (Async & Security Edge)
+# Hardening Specs for Tripwire - Core Logic & Evasion
 
-## Unit 1: Asynchronous I/O Refactor
-[x] Plan tests for async HTTP clients.
-[x] Refactor `backend/app/judge.py` to use `httpx.AsyncClient` instead of the synchronous `urllib.request`.
-[x] Refactor `backend/app/paypal.py` to use `httpx.AsyncClient` for all PayPal sandbox calls.
-[x] Update FastAPI routes in `backend/app/main.py` to `async def` and `await` the executor and judge responses to prevent event loop blocking.
+## Unit 1: The API Boundary & Validation
+[x] **Amount Validation:** Update `ToolCallIn` in `backend/app/main.py` and `backend/app/models.py`. Ensure amounts are cast to `Decimal`, verified as `is_finite()`, strictly `> 0`, and quantized to exactly 2 decimal places (`.quantize(Decimal('0.01'))`). Add tests catching `NaN` and `10.005`.
+[x] **Agent Identity Auth:** Require an `X-Agent-Key` header in `/gateway/tool-call`. The `agent_id` must be derived from this key, ignoring any `agent_id` in the JSON payload.
+[x] **Trust is Mandate-Declared:** Update `Mandate` to include a `trusted_origins` list. In `main.py`, forcefully overwrite the `trust` field of all incoming `sources` to `"untrusted"` UNLESS the source URL exactly matches an origin in `trusted_origins`.
 
-## Unit 2: Edge Rate Limiting & Auth Validation
-[x] Plan tests for rate limiting and edge authentication.
-[x] Install `slowapi` and add a rate limiter to `backend/app/main.py` (e.g., 50 requests/minute per IP or `agent_id`) to protect `/gateway/tool-call`.
-[x] Update `backend/app/main.py` to strictly enforce the authentication logic currently evaluated in `backend/tests/test_auth.py`. Use FastAPI `Depends()` for the API key/token.
+## Unit 2: Concurrency & Idempotency (The TOCTOU Fix)
+[ ] **Kill-switch TOCTOU:** Refactor the `/gateway/tool-call` endpoint in `main.py`. The execution order MUST be: 1) Deterministic policy check. 2) LLM Judge (SLOW - outside DB transaction). 3) Open DB Transaction (`BEGIN EXCLUSIVE`). 4) Re-fetch mandate and verify `revoked == False`. 5) Update budget. 6) Close transaction. 7) Execute PayPal call.
+[ ] **Idempotency Keys:** Update `paypal.py` to derive `PayPal-Request-Id` deterministically from the internal `ticket_id` or `reservation_id` (e.g., `hash(ticket_id + retry_count)`). 
+[ ] **Ticket Expiry:** Add `expires_at` to the `Ticket` model. Add logic so pending tickets older than 24 hours automatically release their budget reservations.
 
-## Unit 3: Advanced Injection Defense
-[x] Plan tests verifying evasion defense against zero-width spaces and base64 payloads.
-[x] Refactor `backend/app/injection.py` to prepare normalized and decoded text for the Lakera Guard ML classifier.
-[x] Verify `backend/tests/test_redteam.py` remains green and catches advanced obfuscation techniques.
+## Unit 3: Policy Engine Resilience
+[ ] **Lookalike Regression:** Revert lookalike detection in `policy.py` to use Levenshtein (edit distance) for the local part of the email, and strict exact-matching for the domain part. Reject non-ASCII payees unless exactly allowlisted.
+[ ] **Taint Evasion:** Add a sanitization pipeline in `policy.py` before `injection_signals`. Strip zero-width characters, unquote URL encodings (`%40` to `@`), resolve HTML entities (`&#64;`), and normalize whitespace/casing.
+[ ] **False Positive Compound Triggers:** Modify the LLM judge/policy logic: An injection escalation should only fire if an injection phrase co-occurs with a tainted payee or amount (e.g., `(urgency OR override) AND tainted_data`).
 
-## Unit 4: Audit Log Scalability
-[x] Plan tests for audit log rotation, chain verification, and tamper detection.
-[x] Update `backend/app/audit.py` to rotate persisted JSONL files by size while preserving chain verification across archived segments.
-Database migration alternative not selected; size-based JSONL rotation was chosen.
+## Unit 4: Evals, Coverage & Scale
+[ ] **Audit Caching:** Update `AuditLog` in `audit.py`. Cache the `head_hash` in memory/SQLite. Upon appending, only hash the new entry against the known head instead of re-reading the entire file.
+[ ] **Benign Evals:** Add at least 30 new realistic benign invoice phrasings to `backend/evals/redteam_cases.json`.
+[ ] **Necessity Test Coverage:** Update `test_every_rule_is_necessary` in `test_redteam.py` to ensure all 20 rules (including the 6 currently missing) are mapped to test cases.

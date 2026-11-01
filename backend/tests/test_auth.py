@@ -11,7 +11,7 @@ from unittest.mock import patch
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from app.main import create_app
+from app.main import agent_id_from_key, create_app
 
 
 AGENT_KEY = "agent-key-" + "a" * 48
@@ -69,6 +69,45 @@ class ApiAuthentication(unittest.TestCase):
         self.assertEqual(missing.status_code, 401)
         self.assertEqual(wrong.status_code, 401)
         self.assertEqual(valid.status_code, 404)
+
+    def test_gateway_ignores_payload_agent_id_and_honors_trusted_origins(self):
+        agent_id = agent_id_from_key(AGENT_KEY)
+        with TestClient(self.app) as client:
+            mandate = client.post(
+                "/mandates",
+                json={
+                    "agent_id": agent_id,
+                    "task": "pay approved invoices",
+                    "budget_total": "100.00",
+                    "per_tx_cap": "50.00",
+                    "approval_over": "25.00",
+                    "allowed_tools": ["create_payout"],
+                    "allowed_payees": ["ap@example.com"],
+                    "max_tx_per_hour": 10,
+                    "ttl_seconds": 3600,
+                    "trusted_origins": ["https://trusted.example.com"],
+                },
+                headers={"X-Admin-Token": ADMIN_TOKEN},
+            )
+            self.assertEqual(mandate.status_code, 200)
+            response = client.post(
+                "/gateway/tool-call",
+                json={
+                    "agent_id": "wrong-agent",
+                    "tool": "create_payout",
+                    "amount": "10.00",
+                    "currency": "USD",
+                    "payee": "ap@example.com",
+                    "sources": [
+                        {"url": "https://trusted.example.com/invoice", "trust": "trusted", "excerpt": "invoice"},
+                        {"url": "https://evil.example.com/invoice", "trust": "untrusted", "excerpt": "invoice"},
+                    ],
+                },
+                headers={"X-Agent-Key": AGENT_KEY},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("decision", response.json())
 
     def test_admin_routes_require_strong_admin_token(self):
         protected_routes = [
