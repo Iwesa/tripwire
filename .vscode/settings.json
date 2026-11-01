@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^Set-Location backend; python -m unittest tests\\.test_core\\.PolicyHelpers$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
