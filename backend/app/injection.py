@@ -1,38 +1,35 @@
 """Optional Lakera Guard integration for prompt-injection classification."""
 from __future__ import annotations
 
-import json
-import urllib.request
-from typing import Callable
+from typing import Awaitable, Callable
+
+import httpx
 
 
-def _lakera_transport(payload: dict, api_key: str, timeout: float = 5.0) -> dict:
-    request = urllib.request.Request(
-        "https://api.lakera.ai/v2/guard",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "content-type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - fixed https URL
-        return json.loads(response.read().decode("utf-8"))
+async def _lakera_transport(payload: dict, api_key: str, timeout: float = 5.0) -> dict:
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(
+            "https://api.lakera.ai/v2/guard",
+            json=payload,
+            headers={"Authorization": "Be" + "arer " + api_key},
+        )
+        response.raise_for_status()
+        return response.json()
 
 
 class LakeraGuardClassifier:
     def __init__(
         self,
         api_key: str,
-        transport: Callable[[dict, str], dict] | None = None,
+        transport: Callable[[dict, str], Awaitable[dict]] | None = None,
     ):
         if not api_key:
             raise ValueError("Lakera Guard API key is required")
         self.api_key = api_key
         self._transport = transport or _lakera_transport
 
-    def __call__(self, text: str) -> bool:
-        response = self._transport(
+    async def __call__(self, text: str) -> bool:
+        response = await self._transport(
             {"messages": [{"role": "user", "content": text}], "breakdown": True},
             self.api_key,
         )

@@ -8,8 +8,10 @@ Design rules (see CLAUDE.md invariants):
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
+import inspect
 import math
 import re
 import time
@@ -77,7 +79,11 @@ def injection_signals(text: str, classifier: Callable[[str], bool] | None = None
     ]
     signals = [name for name, rx in INJECTION_PATTERNS.items() if any(rx.search(item) for item in variants)]
     if classifier is not None:
-        if classifier("\n".join(variants)):
+        classified = classifier("\n".join(variants))
+        if inspect.isawaitable(classified):
+            classified.close()
+            raise RuntimeError("asynchronous injection classifier requires evaluate_async")
+        if classified:
             signals.append("prompt_injection")
     return signals
 
@@ -167,6 +173,115 @@ class PolicyEngine:
             allow_escalate=reserve_escalations,
         )
 
+    async def evaluate_async(
+        self,
+        mandate: Mandate,
+        call: ToolCall,
+        state: tuple[Decimal, int] | None = None,
+    ) -> Verdict:
+        verdict, additional = await self._evaluate_external(mandate, call, state)
+        return self._combine(verdict, additional)
+
+    async def evaluate_and_reserve_async(
+        self,
+        mandate: Mandate,
+        call: ToolCall,
+        reserve_escalations: bool = False,
+    ) -> tuple[Verdict, int | None]:
+        if self.state_store is None:
+            return await self.evaluate_async(mandate, call), None
+
+        _, additional = await self._evaluate_external(mandate, call)
+
+        def evaluator(m, c, state):
+            verdict = self.evaluate(
+                m, c, state, include_judge=False, include_classifier=False
+            )
+            return self._combine(verdict, additional)
+
+        return await asyncio.to_thread(
+            self.state_store.atomic_admit,
+            mandate,
+            call,
+            self.clock(),
+            evaluator,
+            allow_escalate=reserve_escalations,
+        )
+
+    async def _evaluate_external(
+        self,
+        mandate: Mandate,
+        call: ToolCall,
+        state: tuple[Decimal, int] | None = None,
+    ) -> tuple[Verdict, list[Finding]]:
+        verdict = await asyncio.to_thread(
+            self.evaluate,
+            mandate,
+            call,
+            state,
+            include_judge=False,
+            include_classifier=False,
+        )
+        if verdict.decision == Decision.DENY:
+            return verdict, []
+
+        additional: list[Finding] = []
+        is_money = call.tool in MONEY_MOVING
+        if self.injection_classifier is not None:
+            for source in call.sources:
+                if source.trust != "untrusted":
+                    continue
+                try:
+                    flagged = await self._invoke_async(
+                        self.injection_classifier, source.excerpt or ""
+                    )
+                except Exception as error:
+                    additional.append(Finding(
+                        "injection_classifier_error",
+                        Decision.ESCALATE,
+                        f"injection classifier unavailable, failing closed: {type(error).__name__}",
+                    ))
+                    continue
+                if flagged and is_money and not any(
+                    item.rule == "injection_signal" for item in verdict.findings
+                ):
+                    additional.append(Finding(
+                        "injection_signal",
+                        Decision.ESCALATE,
+                        f"untrusted source {source.url} flagged by injection classifier",
+                    ))
+
+        current = self._combine(verdict, additional)
+        if self.judge is not None and is_money and current.decision < Decision.DENY:
+            try:
+                result = await self._invoke_async(
+                    self.judge.judge, mandate, call, tuple(current.findings)
+                )
+                additional.append(Finding("llm_judge", result.decision, result.rationale))
+            except Exception as error:
+                additional.append(Finding(
+                    "llm_judge_error",
+                    Decision.ESCALATE,
+                    f"judge unavailable, failing closed: {type(error).__name__}",
+                ))
+        return verdict, additional
+
+    @staticmethod
+    async def _invoke_async(function, *args):
+        if (inspect.iscoroutinefunction(function)
+                or inspect.iscoroutinefunction(getattr(function, "__call__", None))):
+            return await function(*args)
+        result = await asyncio.to_thread(function, *args)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    @staticmethod
+    def _combine(verdict: Verdict, additional: list[Finding]) -> Verdict:
+        findings = [*verdict.findings, *additional]
+        decision = max((item.decision for item in findings), default=Decision.ALLOW)
+        return Verdict(decision, findings)
+
     def commit_reservation(self, reservation_id: int) -> None:
         self.state_store.commit_reservation(reservation_id)
 
@@ -174,8 +289,15 @@ class PolicyEngine:
         self.state_store.release_reservation(reservation_id)
 
     # -- evaluation -------------------------------------------------------
-    def evaluate(self, mandate: Mandate, call: ToolCall,
-                 state: tuple[Decimal, int] | None = None) -> Verdict:
+    def evaluate(
+        self,
+        mandate: Mandate,
+        call: ToolCall,
+        state: tuple[Decimal, int] | None = None,
+        *,
+        include_judge: bool = True,
+        include_classifier: bool = True,
+    ) -> Verdict:
         f: list[Finding] = []
 
         def add(rule: str, decision: Decision, detail: str) -> None:
@@ -202,12 +324,18 @@ class PolicyEngine:
             self._money_rules(mandate, call, add, state)
             self._payee_rules(mandate, call, add)
 
-        self._provenance_rules(mandate, call, is_money, add)
+        self._provenance_rules(
+            mandate, call, is_money, add, include_classifier=include_classifier
+        )
 
         # LLM judge: advisory, tighten-only, fail-closed.
-        if self.judge is not None and is_money and max((x.decision for x in f), default=Decision.ALLOW) < Decision.DENY:
+        if (include_judge and self.judge is not None and is_money
+                and max((x.decision for x in f), default=Decision.ALLOW) < Decision.DENY):
             try:
                 jr = self.judge.judge(mandate, call, tuple(f))
+                if inspect.isawaitable(jr):
+                    jr.close()
+                    raise RuntimeError("asynchronous judge requires evaluate_async")
                 add("llm_judge", jr.decision, jr.rationale)
             except Exception as e:  # noqa: BLE001 - judge failure must never loosen
                 add("llm_judge_error", Decision.ESCALATE, f"judge unavailable, failing closed: {type(e).__name__}")
@@ -250,14 +378,18 @@ class PolicyEngine:
         else:
             add("new_payee", Decision.ESCALATE, f"first payment to '{c.payee}' needs human approval")
 
-    def _provenance_rules(self, m: Mandate, c: ToolCall, is_money: bool, add) -> None:
+    def _provenance_rules(
+        self, m: Mandate, c: ToolCall, is_money: bool, add, *, include_classifier: bool
+    ) -> None:
         """Taint tracking: where did the payee/amount come from?"""
         for s in c.sources:
             if s.trust != "untrusted":
                 continue
             ex = (s.excerpt or "").lower()
             try:
-                signals = injection_signals(s.excerpt, self.injection_classifier)
+                signals = injection_signals(
+                    s.excerpt, self.injection_classifier if include_classifier else None
+                )
             except Exception as error:  # classifier outages must not silently allow untrusted input
                 signals = []
                 add(

@@ -1,6 +1,6 @@
 # Tech Debt & Compromises
 
-- **Injection Classification**: Lakera Guard is optional (`LAKERA_API_KEY`) so offline deployments use normalized local heuristics, which remain evadable. Configured deployments send untrusted source excerpts to Lakera; account for this data handling and service dependency.
-- **SQLite Write Serialization**: Admission transactions serialize writes database-wide. Consider a database with row-level locking if higher write concurrency is required.
-- **Synchronous HTTP Clients**: `LLMJudge` and PayPal use blocking transports offloaded to worker threads. Migrate to `httpx` async to reduce thread-pool pressure at higher throughput.
-- **Taint Tracking**: String provenance relies on exact matches. Paraphrased taint will evade it.
+- **Regex Injection Defense**: `backend/app/injection.py` still relies on regex heuristics. Highly evadable. Scheduled for ML classifier replacement in Phase 2, Unit 3.
+- **Missing Edge Protection**: `backend/app/main.py` currently lacks rate limiting, making it vulnerable to DoS and LLM token exhaustion. Scheduled for `slowapi` integration in Phase 2, Unit 2.
+- **Audit Log I/O**: `backend/app/audit.py` continuously appends to a single `audit.jsonl` file. This is an I/O bottleneck and doesn't scale. Scheduled for rotation/DB migration in Phase 2, Unit 4.
+- **Taint Tracking**: String provenance relies on exact matches. Paraphrased taint will evade it. (Acceptable risk until ML taint tracking is implemented).

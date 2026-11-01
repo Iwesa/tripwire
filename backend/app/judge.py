@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import json
 import os
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
-from typing import Callable
+from typing import Awaitable, Callable
+
+import httpx
 
 from .models import Decision, Finding, Mandate, ToolCall
 
@@ -39,19 +39,18 @@ class NullJudge:
         return JudgeResult(Decision.ALLOW, "no LLM judge configured")
 
 
-def _anthropic_transport(payload: dict, api_key: str, timeout: float = 20.0) -> dict:
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "content-type": "application/json",
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - fixed https URL
-        return json.loads(resp.read().decode("utf-8"))
+async def _anthropic_transport(payload: dict, api_key: str, timeout: float = 20.0) -> dict:
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            json=payload,
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+            },
+        )
+        response.raise_for_status()
+        return response.json()
 
 
 class LLMJudge:
@@ -59,7 +58,7 @@ class LLMJudge:
         self,
         api_key: str | None = None,
         model: str | None = None,
-        transport: Callable[[dict], dict] | None = None,
+        transport: Callable[[dict], Awaitable[dict]] | None = None,
     ):
         self.model = model or os.getenv("TRIPWIRE_JUDGE_MODEL", "claude-sonnet-5-5")
         key = api_key or os.getenv("ANTHROPIC_API_KEY", "")
@@ -83,12 +82,12 @@ class LLMJudge:
             "messages": [{"role": "user", "content": user}],
         }
 
-    def judge(self, mandate: Mandate, call: ToolCall, findings: tuple[Finding, ...]) -> JudgeResult:
+    async def judge(self, mandate: Mandate, call: ToolCall, findings: tuple[Finding, ...]) -> JudgeResult:
         try:
-            resp = self._transport(self.build_payload(mandate, call, findings))
+            resp = await self._transport(self.build_payload(mandate, call, findings))
             text = "".join(b.get("text", "") for b in resp.get("content", []) if b.get("type") == "text")
             return self.parse(text)
-        except (urllib.error.URLError, TimeoutError, ValueError, KeyError, TypeError, OSError) as e:
+        except (httpx.HTTPError, TimeoutError, ValueError, KeyError, TypeError, OSError) as e:
             return JudgeResult(Decision.ESCALATE, f"judge failed closed ({type(e).__name__})")
 
     @staticmethod

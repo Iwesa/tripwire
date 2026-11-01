@@ -14,12 +14,25 @@ from fastapi.responses import JSONResponse
 
 from app.audit import AuditLog
 from app.main import ApprovalIn, MandateIn, ToolCallIn, _audit_call, create_app
-from app.models import call_from_dict
+from app.judge import JudgeResult
+from app.models import Decision, call_from_dict
 
 
 class ImmediateExecutor:
     def execute(self, call):
         return {"ok": True, "amount": str(call.amount)}
+
+
+class AsyncExecutor:
+    async def execute(self, call):
+        await asyncio.sleep(0)
+        return {"ok": True, "amount": str(call.amount)}
+
+
+class AsyncDenyJudge:
+    async def judge(self, mandate, call, findings):
+        await asyncio.sleep(0)
+        return JudgeResult(Decision.DENY, "asynchronous test denial")
 
 
 class BlockingExecutor:
@@ -114,6 +127,50 @@ def invoke(app, path, *args, method="GET", **kwargs):
 
 
 class PersistentState(unittest.TestCase):
+    def test_api_routes_are_async(self):
+        app = create_app(database_url="sqlite://")
+        self.addCleanup(app.state.store.dispose)
+        endpoints = {
+            route.endpoint.__name__: route.endpoint
+            for route in app.routes
+            if hasattr(route, "endpoint")
+        }
+
+        for name in ("health", "list_mandates", "state", "approvals", "audit_list", "audit_verify", "tool_call"):
+            with self.subTest(endpoint=name):
+                self.assertTrue(inspect.iscoroutinefunction(endpoints[name]))
+
+    def test_gateway_awaits_async_executor(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
+            app = create_app(
+                executor=AsyncExecutor(),
+                database_url=f"sqlite:///{directory}/tripwire.db",
+            )
+            cleanup.callback(app.state.store.dispose)
+            invoke(app, "/mandates", MandateIn(**mandate_payload()), method="POST")
+
+            status, result = invoke(app, "/gateway/tool-call", ToolCallIn(**call_payload("10.00")), method="POST")
+
+            self.assertEqual(status, 200)
+            self.assertEqual(result["result"]["amount"], "10.00")
+
+    def test_gateway_awaits_async_judge_before_execution(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
+            executor = CountingExecutor()
+            app = create_app(
+                executor=executor,
+                judge=AsyncDenyJudge(),
+                database_url=f"sqlite:///{directory}/tripwire.db",
+            )
+            cleanup.callback(app.state.store.dispose)
+            invoke(app, "/mandates", MandateIn(**mandate_payload()), method="POST")
+
+            status, result = invoke(app, "/gateway/tool-call", ToolCallIn(**call_payload("10.00")), method="POST")
+
+            self.assertEqual(status, 403)
+            self.assertEqual(result["decision"], "deny")
+            self.assertEqual(executor.calls, 0)
+
     def test_mandates_tickets_and_accounting_survive_app_restart(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             database_url = f"sqlite:///{directory}/tripwire.db"

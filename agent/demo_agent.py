@@ -12,6 +12,7 @@
 
 The agent is intentionally configured to trust vendor instructions - that is the vulnerability.
 """
+import asyncio
 import argparse
 import json
 import os
@@ -70,7 +71,17 @@ class Agent:
             from app.paypal import DryRunExecutor, PayPalClient
             cid, sec = os.getenv("PAYPAL_CLIENT_ID"), os.getenv("PAYPAL_CLIENT_SECRET")
             ex = PayPalClient(cid, sec) if cid and sec else DryRunExecutor()
-            out = ex.execute(ToolCall(AGENT_ID, "create_payout", Decimal(amount), "USD", payee, agent_note=note))
+
+            async def execute_direct():
+                try:
+                    return await ex.execute(
+                        ToolCall(AGENT_ID, "create_payout", Decimal(amount), "USD", payee, agent_note=note)
+                    )
+                finally:
+                    if isinstance(ex, PayPalClient):
+                        await ex.aclose()
+
+            out = asyncio.run(execute_direct())
             return {"status": 200, "body": {"decision": "none (no firewall)", "result": out}}
         headers = {"X-Agent-Key": os.getenv("TRIPWIRE_AGENT_API_KEY", "")}
         status, body = http_json("POST", f"{GATEWAY}/gateway/tool-call", {

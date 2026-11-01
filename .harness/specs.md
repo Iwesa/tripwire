@@ -1,24 +1,22 @@
-# Hardening Specs for Tripwire
+# Hardening Specs for Tripwire - Phase 2 (Async & Security Edge)
 
-## Unit 1: State Persistence & Concurrency Control
-[x] Plan tests for persistent storage replacing in-memory dictionaries.
-[x] Migrate `mandates`, `tickets`, `_spent`, and `_times` in `backend/app/main.py` and `policy.py` to SQLite (via SQLAlchemy or asyncpg).
-[x] Implement row-level locking or atomic updates for budget and velocity tracking to prevent TOCTOU race conditions.
-[x] Verify all tests in `test_core.py` pass with the new database backend.
+## Unit 1: Asynchronous I/O Refactor
+[x] Plan tests for async HTTP clients.
+[x] Refactor `backend/app/judge.py` to use `httpx.AsyncClient` instead of the synchronous `urllib.request`.
+[x] Refactor `backend/app/paypal.py` to use `httpx.AsyncClient` for all PayPal sandbox calls.
+[x] Update FastAPI routes in `backend/app/main.py` to `async def` and `await` the executor and judge responses to prevent event loop blocking.
 
-## Unit 2: Zero-Trust Access Control
-[x] Plan tests for API authentication.
-[x] Add API key requirement (header `X-Agent-Key`) for `/gateway/tool-call`.
-[x] Add strong token auth for admin endpoints (`/mandates`, `/approvals`).
-[x] Update `agent/demo_agent.py` to pass the necessary auth headers.
+## Unit 2: Edge Rate Limiting & Auth Validation
+[ ] Plan tests for rate limiting and edge authentication.
+[ ] Install `slowapi` and add a rate limiter to `backend/app/main.py` (e.g., 50 requests/minute per IP or `agent_id`) to protect `/gateway/tool-call`.
+[ ] Update `backend/app/main.py` to strictly enforce the authentication logic currently evaluated in `backend/tests/test_auth.py`. Use FastAPI `Depends()` for the API key/token.
 
-## Unit 3: Immutable Asynchronous Auditing
-[x] Refactor `backend/app/audit.py` to use `asyncio` for non-blocking disk/network writes.
-[x] Upgrade SHA-256 hash-chaining to include HMAC signing using a private key defined in `.env`.
-[x] Write a test verifying that manual edits to `audit.jsonl` trigger an HMAC verification failure.
+## Unit 3: Advanced Injection Defense
+[ ] Plan tests verifying evasion defense against zero-width spaces and base64 payloads.
+[ ] Refactor `backend/app/injection.py` to replace regex heuristics with an ML-based text classification pipeline (e.g., local HuggingFace `pipeline("text-classification")` or Lakera Guard API).
+[ ] Verify `backend/tests/test_redteam.py` remains green and catches advanced obfuscation techniques.
 
-## Unit 4: Robust Evasion Defense
-[x] Plan tests for advanced prompt injection evasion (e.g., zero-width spaces, base64 encoding).
-[x] Replace regex in `injection_signals` (`backend/app/policy.py`) with an ML-based classifier integration (e.g., Lakera Guard API or local HuggingFace pipeline).
-[x] Upgrade `lookalike_of` to use vector-based semantic similarity instead of `difflib`.
-[x] Verify `test_redteam.py` remains green and catches advanced obfuscation.
+## Unit 4: Audit Log Scalability
+[ ] Plan tests for audit log rotation or DB storage.
+[ ] Update `backend/app/audit.py` to implement file rotation (e.g., daily or size-based rotation) to prevent `.jsonl` I/O bottlenecks.
+[ ] *Alternative to rotation:* Migrate the hash-chained audit ledger entirely into the new persistent layer defined in `backend/app/storage.py`. Ensure `verify()` logic still holds cryptographic integrity.

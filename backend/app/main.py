@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import os
 import hmac
+import inspect
 import re
 import time
 import uuid
@@ -194,6 +195,8 @@ def create_app(executor=None, judge=None, audit: AuditLog | None = None, clock=t
     )
 
     app = FastAPI(title="Tripwire", description="Spend firewall for AI agents (PayPal sandbox)")
+    if isinstance(executor, PayPalClient):
+        app.add_event_handler("shutdown", executor.aclose)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=os.getenv("TRIPWIRE_CORS", "http://localhost:5173").split(","),
@@ -238,7 +241,12 @@ def create_app(executor=None, judge=None, audit: AuditLog | None = None, clock=t
 
         async def execute_and_record() -> dict:
             try:
-                result = await asyncio.to_thread(executor.execute, call)
+                if inspect.iscoroutinefunction(executor.execute):
+                    result = await executor.execute(call)
+                else:
+                    result = await asyncio.to_thread(executor.execute, call)
+                    if inspect.isawaitable(result):
+                        result = await result
             except Exception as e:
                 release_error = None
                 if reservation_id is not None:
@@ -296,7 +304,7 @@ def create_app(executor=None, judge=None, audit: AuditLog | None = None, clock=t
         return _ticket_from_record(record).to_dict()
 
     @app.get("/health")
-    def health():
+    async def health():
         return {"ok": True, "executor": type(executor).__name__, "judge": type(judge).__name__}
 
     # ---- mandates ----
@@ -311,8 +319,8 @@ def create_app(executor=None, judge=None, audit: AuditLog | None = None, clock=t
         return m.to_dict()
 
     @app.get("/mandates", dependencies=[Depends(require_admin_token)])
-    def list_mandates():
-        return store.list_mandates()
+    async def list_mandates():
+        return await asyncio.to_thread(store.list_mandates)
 
     @app.post("/mandates/{agent_id}/revoke", dependencies=[Depends(require_admin_token)])
     async def revoke(agent_id: str):
@@ -334,12 +342,12 @@ def create_app(executor=None, judge=None, audit: AuditLog | None = None, clock=t
         return {"agent_id": agent_id, "revoked": True}
 
     @app.get("/state/{agent_id}", dependencies=[Depends(require_admin_token)])
-    def state(agent_id: str):
-        data = store.get_mandate(agent_id)
+    async def state(agent_id: str):
+        data = await asyncio.to_thread(store.get_mandate, agent_id)
         if data is None:
             raise HTTPException(404, "unknown agent")
         m = _parse_dict(data, mandate_from_dict)
-        spent, recent = store.policy_state(agent_id, clock())
+        spent, recent = await asyncio.to_thread(store.policy_state, agent_id, clock())
         return {"agent_id": agent_id, "spent": str(spent), "remaining": str(m.budget_total - spent),
                 "tx_last_hour": recent, "revoked": m.revoked}
 
@@ -351,8 +359,8 @@ def create_app(executor=None, judge=None, audit: AuditLog | None = None, clock=t
         if data is None:
             raise HTTPException(404, "no mandate for this agent")
         m = _parse_dict(data, mandate_from_dict)
-        verdict, reservation_id = await asyncio.to_thread(
-            engine.evaluate_and_reserve, m, call, reserve_escalations=True
+        verdict, reservation_id = await engine.evaluate_and_reserve_async(
+            m, call, reserve_escalations=True
         )
         try:
             await audit.append("tool_call_evaluated", call.agent_id,
@@ -375,8 +383,9 @@ def create_app(executor=None, judge=None, audit: AuditLog | None = None, clock=t
 
     # ---- human approvals ----
     @app.get("/approvals", dependencies=[Depends(require_admin_token)])
-    def approvals(status: str | None = None):
-        return [_public_ticket(record) for record in store.list_tickets(status)]
+    async def approvals(status: str | None = None):
+        records = await asyncio.to_thread(store.list_tickets, status)
+        return [_public_ticket(record) for record in records]
 
     async def _resolve(ticket_id: str, approve: bool, who: str) -> dict:
         record = await asyncio.to_thread(store.get_ticket, ticket_id)
@@ -421,15 +430,15 @@ def create_app(executor=None, judge=None, audit: AuditLog | None = None, clock=t
 
     # ---- audit ----
     @app.get("/audit", dependencies=[Depends(require_admin_token)])
-    def audit_list(limit: int = 100, agent_id: str | None = None):
+    async def audit_list(limit: int = 100, agent_id: str | None = None):
         try:
-            return audit.entries(limit=limit, agent_id=agent_id)
+            return await asyncio.to_thread(audit.entries, limit=limit, agent_id=agent_id)
         except RuntimeError as e:
             raise HTTPException(503, "audit integrity verification failed") from e
 
     @app.get("/audit/verify", dependencies=[Depends(require_admin_token)])
-    def audit_verify():
-        ok, bad, count = audit.verify_with_count()
+    async def audit_verify():
+        ok, bad, count = await asyncio.to_thread(audit.verify_with_count)
         return {"ok": ok, "first_bad_seq": bad, "entries": count}
 
     return app

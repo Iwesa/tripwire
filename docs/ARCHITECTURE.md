@@ -31,6 +31,7 @@ Tripwire is a harness twice over, and that is the project's thesis:
 | Measure, don't vibe | Scoreboard test: attacks blocked N/N, benign wrongly denied 0 |
 | Independent review with fresh context | `.harness/agents/reviewer.md`; judge sees untrusted text as quoted data only |
 | Observability | Async append to an HMAC-signed SHA-256 chain, verify endpoint, dashboard |
+| Non-blocking external checks | HTTPX async clients for the LLM judge, injection classifier, and PayPal sandbox |
 
 ## Known limitations (say these in the README; judges respect honesty)
 - Prompt-injection detection normalizes zero-width characters and decodes Base64 before applying local heuristics.

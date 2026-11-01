@@ -13,4 +13,5 @@ You are an AI agent working on Tripwire, a spend firewall for AI agents. Do not 
 ## Base Rules
 1. Never modify code without first writing a test in `backend/tests/`.
 2. Do not fix failing builds manually; fix the instructions or specs that caused them.
-3. If an external service (e.g., PayPal Sandbox) is down, do not hallucinate a fix. Use `blocked.md`.
+3. If an external service (e.g., PayPal Sandbox, HuggingFace) is down or blocking, do not hallucinate a fix. Use `.harness/blocked.md`.
+4. All new network calls must be asynchronous (e.g., use `httpx`, not `requests` or `urllib`).
