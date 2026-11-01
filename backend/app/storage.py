@@ -12,7 +12,7 @@ from sqlalchemy import Column, Float, Integer, MetaData, String, Table, Text, cr
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Connection, Engine, make_url
 
-from .models import MONEY_MOVING, Mandate, ToolCall, Verdict
+from .models import MONEY_MOVING, Decision, Mandate, ToolCall, Verdict
 
 
 class StateStore:
@@ -224,6 +224,69 @@ class StateStore:
                 )
             )
             return verdict, result.inserted_primary_key[0]
+
+    def reserve_budget(self, mandate: Mandate, call: ToolCall, now: float,
+                      *, verdict: Verdict | None = None, allow_escalate: bool = False) -> int | None:
+        effective = verdict or Verdict(Decision.ALLOW, [])
+        if effective.decision == Decision.DENY:
+            return None
+        if effective.decision == Decision.ESCALATE and not allow_escalate:
+            return None
+        if mandate.revoked:
+            raise ValueError("mandate revoked; cannot reserve budget")
+        if mandate.expires_at is not None and mandate.expires_at < now:
+            raise ValueError("mandate expired; cannot reserve budget")
+        with self._write() as connection:
+            rows = connection.execute(
+                select(self.policy_events.c.amount, self.policy_events.c.happened_at).where(
+                    self.policy_events.c.agent_id == call.agent_id
+                )
+            ).all()
+            spent = sum((Decimal(amount) for amount, _ in rows if amount is not None), Decimal("0"))
+            recent = sum(1 for _, happened_at in rows if now - happened_at < 3600)
+            if call.tool in MONEY_MOVING and call.amount is not None:
+                if spent + call.amount > mandate.budget_total:
+                    raise ValueError("budget exceeded")
+                if recent >= mandate.max_tx_per_hour:
+                    raise ValueError("velocity exceeded")
+            amount = str(call.amount) if call.tool in MONEY_MOVING and call.amount is not None else None
+            result = connection.execute(
+                self.policy_events.insert().values(
+                    agent_id=call.agent_id,
+                    happened_at=now,
+                    amount=amount,
+                    status="reserved",
+                )
+            )
+            return result.inserted_primary_key[0]
+
+    def expire_pending_tickets(self, now: float) -> None:
+        with self.engine.connect() as connection:
+            pending = connection.execute(
+                select(self.tickets.c.id, self.tickets.c.data)
+                .where(self.tickets.c.status == "pending")
+            ).all()
+        for ticket_id, value in pending:
+            record = json.loads(value)
+            expires_at = record.get("expires_at")
+            if expires_at is None:
+                created = float(record.get("created", now))
+                expires_at = created + 24 * 60 * 60
+            if expires_at > now:
+                continue
+            reservation_id = record.get("_reservation_id")
+            if reservation_id is None:
+                reservation_id = record.get("call", {}).get("args", {}).get("reservation_id")
+            record["status"] = "denied"
+            record["resolved_by"] = "expired"
+            if reservation_id is not None:
+                self.release_reservation(reservation_id)
+            with self._write() as connection:
+                connection.execute(
+                    update(self.tickets)
+                    .where(self.tickets.c.id == ticket_id, self.tickets.c.status == "pending")
+                    .values(status="denied", data=json.dumps(record))
+                )
 
     def record(self, call: ToolCall, now: float) -> None:
         amount = str(call.amount) if call.tool in MONEY_MOVING and call.amount is not None else None

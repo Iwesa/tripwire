@@ -103,7 +103,7 @@
         "agent_id": "procure-1",
         "tool": "create_payout",
         "amount": "30.00",
-        "payee": "ap@acme-suppl1es.com"
+        "payee": "a1@acme-supplies.com"
       }
     },
     {

@@ -6,14 +6,14 @@
 [x] **Trust is Mandate-Declared:** Update `Mandate` to include a `trusted_origins` list. In `main.py`, forcefully overwrite the `trust` field of all incoming `sources` to `"untrusted"` UNLESS the source URL exactly matches an origin in `trusted_origins`.
 
 ## Unit 2: Concurrency & Idempotency (The TOCTOU Fix)
-[ ] **Kill-switch TOCTOU:** Refactor the `/gateway/tool-call` endpoint in `main.py`. The execution order MUST be: 1) Deterministic policy check. 2) LLM Judge (SLOW - outside DB transaction). 3) Open DB Transaction (`BEGIN EXCLUSIVE`). 4) Re-fetch mandate and verify `revoked == False`. 5) Update budget. 6) Close transaction. 7) Execute PayPal call.
-[ ] **Idempotency Keys:** Update `paypal.py` to derive `PayPal-Request-Id` deterministically from the internal `ticket_id` or `reservation_id` (e.g., `hash(ticket_id + retry_count)`). 
-[ ] **Ticket Expiry:** Add `expires_at` to the `Ticket` model. Add logic so pending tickets older than 24 hours automatically release their budget reservations.
+[x] **Kill-switch TOCTOU:** Refactor the `/gateway/tool-call` endpoint in `main.py`. The execution order MUST be: 1) Deterministic policy check. 2) LLM Judge (SLOW - outside DB transaction). 3) Open DB Transaction (`BEGIN EXCLUSIVE`). 4) Re-fetch mandate and verify `revoked == False`. 5) Update budget. 6) Close transaction. 7) Execute PayPal call.
+[x] **Idempotency Keys:** Update `paypal.py` to derive `PayPal-Request-Id` deterministically from the internal `ticket_id` or `reservation_id` (e.g., `hash(ticket_id + retry_count)`). 
+[x] **Ticket Expiry:** Add `expires_at` to the `Ticket` model. Add logic so pending tickets older than 24 hours automatically release their budget reservations.
 
 ## Unit 3: Policy Engine Resilience
-[ ] **Lookalike Regression:** Revert lookalike detection in `policy.py` to use Levenshtein (edit distance) for the local part of the email, and strict exact-matching for the domain part. Reject non-ASCII payees unless exactly allowlisted.
-[ ] **Taint Evasion:** Add a sanitization pipeline in `policy.py` before `injection_signals`. Strip zero-width characters, unquote URL encodings (`%40` to `@`), resolve HTML entities (`&#64;`), and normalize whitespace/casing.
-[ ] **False Positive Compound Triggers:** Modify the LLM judge/policy logic: An injection escalation should only fire if an injection phrase co-occurs with a tainted payee or amount (e.g., `(urgency OR override) AND tainted_data`).
+[x] **Lookalike Regression:** Revert lookalike detection in `policy.py` to use Levenshtein (edit distance) for the local part of the email, and strict exact-matching for the domain part. Reject non-ASCII payees unless exactly allowlisted.
+[x] **Taint Evasion:** Add a sanitization pipeline in `policy.py` before `injection_signals`. Strip zero-width characters, unquote URL encodings (`%40` to `@`), resolve HTML entities (`&#64;`), and normalize whitespace/casing.
+[x] **False Positive Compound Triggers:** Modify the LLM judge/policy logic: An injection escalation should only fire if an injection phrase co-occurs with a tainted payee or amount (e.g., `(urgency OR override) AND tainted_data`).
 
 ## Unit 4: Evals, Coverage & Scale
 [ ] **Audit Caching:** Update `AuditLog` in `audit.py`. Cache the `head_hash` in memory/SQLite. Upon appending, only hash the new entry against the known head instead of re-reading the entire file.

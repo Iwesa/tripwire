@@ -1,5 +1,7 @@
 # Tech Debt & Compromises
 
-- **Injection Detection Fallback**: Lakera Guard classification is optional and receives original, normalized, and decodable Base64 text when configured. Without `LAKERA_API_KEY`, local pattern checks remain heuristic and can be evaded; classifier failures escalate affected payments.
-- **Audit Log Retention**: Persisted audit logs rotate into numbered JSONL segments before an append would exceed 10 MiB (a single oversized event may exceed it). Segments are retained indefinitely, and full-chain verification still scans all entries; deployments with long histories should plan archival or indexed database storage.
-- **Taint Tracking**: String provenance relies on exact matches. Paraphrased taint will evade it. (Acceptable risk until ML taint tracking is implemented).
+- **Caller-Declared Trust**: Currently, agents can claim a URL is `trusted`, bypassing taint tracking. Must be moved to a `trusted_origins` list on the Mandate.
+- **Judge inside Transaction**: The LLM judge runs inside the SQLite write transaction, locking the DB for up to 20 seconds. Vulnerable to race conditions/kill-switch bypass.
+- **Float Validation**: `NaN` or `.005` amounts crash the engine or create execution mismatches.
+- **Cosine N-Grams for Emails**: Currently fails on TLD swaps and padded subdomains. Needs edit-distance.
+- **Audit File I/O**: `AuditLog` re-reads the entire file on every append. $O(N^2)$ scaling bottleneck.

@@ -306,6 +306,58 @@ class PersistentState(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertEqual(result["decision"], "allow")
 
+    def test_expired_pending_tickets_release_budget_reservations(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
+            app = create_app(executor=ImmediateExecutor(), database_url=f"sqlite:///{directory}/tripwire.db")
+            cleanup.callback(app.state.store.dispose)
+            invoke(app, "/mandates", MandateIn(**mandate_payload()), method="POST")
+            ticket_id = "expired-ticket"
+            ticket = {
+                "id": ticket_id,
+                "status": "pending",
+                "created": 1.0,
+                "expires_at": 1.0,
+                "resolved_by": None,
+                "call": {
+                    "agent_id": "agent-1",
+                    "tool": "create_payout",
+                    "amount": "30.00",
+                    "currency": "USD",
+                    "payee": "ap@example.com",
+                    "args": {"reservation_id": 999},
+                    "sources": [],
+                    "agent_note": "",
+                },
+                "verdict": {"decision": "allow", "findings": []},
+                "result": None,
+                "_reservation_id": 999,
+            }
+            with app.state.store.engine.begin() as connection:
+                connection.execute(app.state.store.policy_events.insert().values(
+                    id=999,
+                    agent_id="agent-1",
+                    happened_at=1.0,
+                    amount="30.00",
+                    status="reserved",
+                ))
+                connection.execute(app.state.store.tickets.insert().values(
+                    id=ticket_id,
+                    agent_id="agent-1",
+                    status="pending",
+                    created=1.0,
+                    data=json.dumps(ticket),
+                ))
+
+            app.state.store.expire_pending_tickets(24 * 60 * 60 + 2)
+            expired = app.state.store.get_ticket(ticket_id)
+            self.assertEqual(expired["status"], "denied")
+            self.assertEqual(expired["resolved_by"], "expired")
+            with app.state.store.engine.connect() as connection:
+                remaining = connection.execute(
+                    app.state.store.policy_events.select().where(app.state.store.policy_events.c.id == 999)
+                ).fetchall()
+            self.assertEqual(len(remaining), 0)
+
 
 class AuditRequestIntegrity(unittest.TestCase):
     def make_app(self, executor, audit):

@@ -26,7 +26,7 @@ from slowapi.util import get_remote_address
 from .audit import AuditLog
 from .injection import LakeraGuardClassifier
 from .judge import LLMJudge, NullJudge
-from .models import Decision, Finding, Source, ToolCall, Verdict, call_from_dict, mandate_from_dict
+from .models import MONEY_MOVING, Decision, Finding, Source, ToolCall, Verdict, call_from_dict, mandate_from_dict
 from .paypal import DryRunExecutor, PayPalClient, PayPalError
 from .policy import PolicyEngine
 from .storage import StateStore
@@ -93,14 +93,16 @@ class Ticket:
     call: ToolCall
     verdict: Verdict
     created: float
+    expires_at: float | None = None
     status: str = "pending"  # pending | approved | denied
     resolved_by: str | None = None
     result: dict | None = field(default=None)
     reservation_id: int | None = None
 
     def to_dict(self) -> dict:
-        return {"id": self.id, "status": self.status, "created": self.created, "resolved_by": self.resolved_by,
-                "call": self.call.to_dict(), "verdict": self.verdict.to_dict(), "result": self.result}
+        return {"id": self.id, "status": self.status, "created": self.created, "expires_at": self.expires_at,
+                "resolved_by": self.resolved_by, "call": self.call.to_dict(), "verdict": self.verdict.to_dict(),
+                "result": self.result}
 
     def to_record(self) -> dict:
         return {**self.to_dict(), "_reservation_id": self.reservation_id}
@@ -117,6 +119,7 @@ def _ticket_from_record(record: dict) -> Ticket:
         call_from_dict(record["call"]),
         verdict,
         record["created"],
+        record.get("expires_at"),
         record["status"],
         record.get("resolved_by"),
         record.get("result"),
@@ -413,6 +416,7 @@ def create_app(executor=None, judge=None, audit: AuditLog | None = None, clock=t
                 call.agent_id = legacy_id
         if data is None:
             raise HTTPException(404, "no mandate for this agent")
+        await asyncio.to_thread(store.expire_pending_tickets, clock())
         m = _parse_dict(data, mandate_from_dict)
         trusted = set(m.trusted_origins)
         call.sources = [
@@ -423,9 +427,40 @@ def create_app(executor=None, judge=None, audit: AuditLog | None = None, clock=t
             )
             for source in call.sources
         ]
-        verdict, reservation_id = await engine.evaluate_and_reserve_async(
-            m, call, reserve_escalations=True
-        )
+
+        deterministic = engine.evaluate(m, call, include_judge=False, include_classifier=True)
+        if deterministic.decision == Decision.DENY:
+            return JSONResponse(status_code=403, content={"decision": "deny", **deterministic.to_dict()})
+
+        judge_findings: list[Finding] = []
+        if engine.judge is not None and call.tool in MONEY_MOVING and deterministic.decision < Decision.DENY:
+            try:
+                result = await engine._invoke_async(engine.judge.judge, m, call, tuple(deterministic.findings))
+                judge_findings.append(Finding("llm_judge", result.decision, result.rationale))
+            except Exception as error:  # noqa: BLE001
+                judge_findings.append(Finding(
+                    "llm_judge_error",
+                    Decision.ESCALATE,
+                    f"judge unavailable, failing closed: {type(error).__name__}",
+                ))
+        verdict = engine._combine(deterministic, judge_findings)
+        if verdict.decision == Decision.DENY:
+            return JSONResponse(status_code=403, content={"decision": "deny", **verdict.to_dict()})
+
+        try:
+            reservation_id = await asyncio.to_thread(
+                store.reserve_budget,
+                m,
+                call,
+                clock(),
+                verdict=verdict,
+                allow_escalate=True,
+            )
+        except Exception:
+            if verdict.decision == Decision.ESCALATE:
+                await audit.append("approval_requested", call.agent_id, {"ticket": "rejected"})
+            raise
+
         try:
             await audit.append("tool_call_evaluated", call.agent_id,
                                {"call": _audit_call(call),
@@ -435,13 +470,21 @@ def create_app(executor=None, judge=None, audit: AuditLog | None = None, clock=t
                 await asyncio.to_thread(engine.release_reservation, reservation_id)
             raise
 
-        if verdict.decision == Decision.DENY:
-            return JSONResponse(status_code=403, content={"decision": "deny", **verdict.to_dict()})
         if verdict.decision == Decision.ESCALATE:
-            t = Ticket(uuid.uuid4().hex[:10], call, verdict, clock(), reservation_id=reservation_id)
+            t = Ticket(
+                uuid.uuid4().hex[:10],
+                call,
+                verdict,
+                clock(),
+                expires_at=clock() + 24 * 60 * 60,
+                reservation_id=reservation_id,
+            )
+            call.args["ticket_id"] = t.id
+            call.args["reservation_id"] = reservation_id
             await asyncio.to_thread(store.save_ticket, t.to_record())
             await audit.append("approval_requested", call.agent_id, {"ticket": t.id})
             return JSONResponse(status_code=202, content={"decision": "escalate", "ticket_id": t.id, **verdict.to_dict()})
+        call.args["reservation_id"] = reservation_id
         result = await _execute(call, via="auto", reservation_id=reservation_id)
         return {"decision": "allow", "result": result, **verdict.to_dict()}
 

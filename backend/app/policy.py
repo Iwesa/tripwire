@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import html
 import inspect
 import math
 import re
@@ -19,6 +20,7 @@ import unicodedata
 from collections import Counter
 from decimal import Decimal
 from typing import Callable
+from urllib.parse import unquote
 
 from .models import MONEY_MOVING, Decision, Finding, Mandate, ToolCall, Verdict
 
@@ -37,14 +39,26 @@ INJECTION_PATTERNS: dict[str, re.Pattern] = {
 _BASE64_TOKEN = re.compile(r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{16,}={0,2}(?![A-Za-z0-9+/_-])")
 
 
+def _sanitize_text(text: str) -> str:
+    value = unicodedata.normalize("NFKC", str(text or ""))
+    value = re.sub(r"[\u200b\u2060\u200c\u200d\ufeff]+", " ", value)
+    value = "".join(" " if unicodedata.category(char) in {"Cf", "Cs"} else char for char in value)
+    value = html.unescape(value)
+    value = unquote(value)
+    value = html.unescape(value)
+    value = value.replace("%20", " ")
+    value = re.sub(r"\s+", " ", value, flags=re.S).strip()
+    return value.casefold()
+
+
 def _normalize_untrusted_text(text: str) -> str:
     normalized = unicodedata.normalize("NFKC", text)
-    return "".join(char for char in normalized if unicodedata.category(char) != "Cf")
+    return "".join(" " if unicodedata.category(char) in {"Cf", "Cs"} else char for char in normalized)
 
 
 def _separated_untrusted_text(text: str) -> str:
     normalized = unicodedata.normalize("NFKC", text)
-    return "".join(" " if unicodedata.category(char) == "Cf" else char for char in normalized)
+    return "".join(" " if unicodedata.category(char) in {"Cf", "Cs"} else char for char in normalized)
 
 
 def _decoded_texts(text: str) -> list[str]:
@@ -71,11 +85,13 @@ def _decoded_texts(text: str) -> list[str]:
 def injection_signals(text: str, classifier: Callable[[str], bool] | None = None) -> list[str]:
     """Detect known injection phrases after normalization and optional classification."""
     source = str(text or "")
+    sanitized = _sanitize_text(source)
     normalized = _normalize_untrusted_text(source)
     variants = [
-        normalized,
-        _separated_untrusted_text(source),
-        *(_normalize_untrusted_text(item) for item in _decoded_texts(normalized)),
+        sanitized,
+        _sanitize_text(normalized),
+        _sanitize_text(_separated_untrusted_text(source)),
+        *(_sanitize_text(item) for item in _decoded_texts(normalized)),
     ]
     signals = [name for name, rx in INJECTION_PATTERNS.items() if any(rx.search(item) for item in variants)]
     if classifier is not None:
@@ -114,15 +130,42 @@ def _cosine_similarity(left: Counter, right: Counter) -> float:
     return dot / (left_norm * right_norm)
 
 
+def _levenshtein_distance(left: str, right: str) -> int:
+    if left == right:
+        return 0
+    if not left:
+        return len(right)
+    if not right:
+        return len(left)
+    previous = list(range(len(right) + 1))
+    for i, left_char in enumerate(left, start=1):
+        current = [i]
+        for j, right_char in enumerate(right, start=1):
+            insertion = current[j - 1] + 1
+            deletion = previous[j] + 1
+            substitution = previous[j - 1] + (left_char != right_char)
+            current.append(min(insertion, deletion, substitution))
+        previous = current
+    return previous[-1]
+
+
 def lookalike_of(payee: str, allowed) -> str | None:
     """Return the allowlisted payee this one imitates, if any."""
-    p = _norm(payee)
-    p_vector = _character_vector(p)
+    if not payee or "@" not in payee:
+        return None
+    payee_local, payee_domain = payee.rsplit("@", 1)
+    payee_local = payee_local.lower()
+    payee_domain = payee_domain.lower()
     for a in allowed:
-        if payee.lower() == a.lower():
+        if not a or "@" not in a:
             continue
-        candidate = _norm(a)
-        if p == candidate or _cosine_similarity(p_vector, _character_vector(candidate)) >= _LOOKALIKE_THRESHOLD:
+        allowed_local, allowed_domain = a.rsplit("@", 1)
+        if payee_domain != allowed_domain.lower():
+            continue
+        if payee_local == allowed_local.lower():
+            continue
+        threshold = max(1, len(allowed_local) // 4)
+        if _levenshtein_distance(payee_local, allowed_local.lower()) <= threshold:
             return a
     return None
 
@@ -242,7 +285,12 @@ class PolicyEngine:
                         f"injection classifier unavailable, failing closed: {type(error).__name__}",
                     ))
                     continue
-                if flagged and is_money and not any(
+                excerpt = (source.excerpt or "").lower()
+                tainted_data = (
+                    bool(call.payee and call.payee.lower() in excerpt)
+                    or (call.amount is not None and str(call.amount).lower() in excerpt)
+                )
+                if tainted_data and flagged and is_money and not any(
                     item.rule == "injection_signal" for item in verdict.findings
                 ):
                     additional.append(Finding(
@@ -374,6 +422,9 @@ class PolicyEngine:
         if not c.payee:
             add("payee_missing", Decision.DENY, "money-moving call without a declared payee")
             return
+        if any(ord(ch) > 127 for ch in c.payee) and c.payee.lower() not in {value.lower() for value in m.allowed_payees}:
+            add("non_ascii_payee", Decision.DENY, f"'{c.payee}' contains non-ASCII characters and is not exactly allowlisted")
+            return
         if c.payee.lower() in m.allowed_payees:
             return
         imitated = lookalike_of(c.payee, m.allowed_payees)
@@ -406,13 +457,16 @@ class PolicyEngine:
             payee_tainted = bool(c.payee) and c.payee.lower() in ex
             amount_tainted = c.amount is not None and str(c.amount) in ex
             allowlisted = bool(c.payee) and c.payee.lower() in m.allowed_payees
+            tainted_data = payee_tainted or amount_tainted
 
             if is_money and payee_tainted and not allowlisted:
                 sev = "with injection patterns " + str(signals) if signals else "unverified"
                 add("tainted_payee", Decision.DENY, f"payee came from untrusted content at {s.url} ({sev})")
-            elif is_money and signals:
-                tag = " (payee/amount echoed from it)" if (payee_tainted or amount_tainted) else ""
+            elif is_money and signals and tainted_data:
+                tag = " (payee/amount echoed from it)" if tainted_data else ""
                 add("injection_signal", Decision.ESCALATE, f"untrusted source {s.url} contains {signals}{tag}")
+            elif is_money and signals and not tainted_data and allowlisted:
+                add("injection_signal", Decision.ESCALATE, f"untrusted source {s.url} contains {signals} while the allowlisted payee is echoed")
 
     @staticmethod
     def _verdict(findings: list[Finding]) -> Verdict:
