@@ -12,7 +12,20 @@ from sqlalchemy import Column, Float, Integer, MetaData, String, Table, Text, cr
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Connection, Engine, make_url
 
-from .models import MONEY_MOVING, Decision, Mandate, ToolCall, Verdict
+from .models import MONEY_MOVING, Decision, Mandate, ToolCall, Verdict, mandate_from_dict
+
+
+class ReservationRefused(ValueError):
+    """The stored state refused a budget reservation.
+
+    `rule` is the policy finding to report (kill_switch, mandate_expired, mandate_missing, budget_exceeded,
+    velocity). It subclasses ValueError so callers written against the old behaviour keep working.
+    """
+
+    def __init__(self, rule: str, detail: str):
+        super().__init__(detail)
+        self.rule = rule
+        self.detail = detail
 
 
 class StateStore:
@@ -200,6 +213,12 @@ class StateStore:
     def atomic_admit(self, mandate: Mandate, call: ToolCall, now: float, evaluator,
                      allow_escalate: bool = False) -> tuple[Verdict, int | None]:
         with self._write() as connection:
+            stored = connection.execute(
+                select(self.mandates.c.data).where(self.mandates.c.agent_id == call.agent_id)
+            ).scalar_one_or_none()
+            if stored is None:
+                raise ReservationRefused("mandate_missing", "no stored mandate for this agent; cannot reserve budget")
+            current = mandate_from_dict(json.loads(stored))
             rows = connection.execute(
                 select(self.policy_events.c.amount, self.policy_events.c.happened_at).where(
                     self.policy_events.c.agent_id == call.agent_id
@@ -207,7 +226,7 @@ class StateStore:
             ).all()
             spent = sum((Decimal(amount) for amount, _ in rows if amount is not None), Decimal("0"))
             recent = sum(1 for _, happened_at in rows if now - happened_at < 3600)
-            verdict = evaluator(mandate, call, (spent, recent))
+            verdict = evaluator(current, call, (spent, recent))
             should_reserve = verdict.decision.value == 0 or (
                 allow_escalate and verdict.decision.value < 2
             )
@@ -233,10 +252,22 @@ class StateStore:
         if effective.decision == Decision.ESCALATE and not allow_escalate:
             return None
         if mandate.revoked:
-            raise ValueError("mandate revoked; cannot reserve budget")
+            raise ReservationRefused("kill_switch", "mandate revoked; cannot reserve budget")
         if mandate.expires_at is not None and mandate.expires_at < now:
-            raise ValueError("mandate expired; cannot reserve budget")
+            raise ReservationRefused("mandate_expired", "mandate expired; cannot reserve budget")
         with self._write() as connection:
+            # The caller's copy may be stale (it was loaded before the judge ran). Re-read the mandate inside
+            # this write transaction so a revocation, expiry or limit change committed since then still applies.
+            stored = connection.execute(
+                select(self.mandates.c.data).where(self.mandates.c.agent_id == call.agent_id)
+            ).scalar_one_or_none()
+            if stored is None:
+                raise ReservationRefused("mandate_missing", "no stored mandate for this agent; cannot reserve budget")
+            current = mandate_from_dict(json.loads(stored))
+            if current.revoked:
+                raise ReservationRefused("kill_switch", "mandate revoked; cannot reserve budget")
+            if current.expires_at is not None and current.expires_at < now:
+                raise ReservationRefused("mandate_expired", "mandate expired; cannot reserve budget")
             rows = connection.execute(
                 select(self.policy_events.c.amount, self.policy_events.c.happened_at).where(
                     self.policy_events.c.agent_id == call.agent_id
@@ -245,10 +276,10 @@ class StateStore:
             spent = sum((Decimal(amount) for amount, _ in rows if amount is not None), Decimal("0"))
             recent = sum(1 for _, happened_at in rows if now - happened_at < 3600)
             if call.tool in MONEY_MOVING and call.amount is not None:
-                if spent + call.amount > mandate.budget_total:
-                    raise ValueError("budget exceeded")
-                if recent >= mandate.max_tx_per_hour:
-                    raise ValueError("velocity exceeded")
+                if spent + call.amount > current.budget_total:
+                    raise ReservationRefused("budget_exceeded", "budget exceeded")
+                if recent >= current.max_tx_per_hour:
+                    raise ReservationRefused("velocity", "velocity exceeded")
             amount = str(call.amount) if call.tool in MONEY_MOVING and call.amount is not None else None
             result = connection.execute(
                 self.policy_events.insert().values(

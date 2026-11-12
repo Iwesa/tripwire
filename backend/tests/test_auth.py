@@ -156,12 +156,13 @@ class ApiAuthentication(unittest.TestCase):
                 demo_agent.Agent(guarded=True).pay("10.00", "ap@example.com")
             self.assertEqual(request.call_args.kwargs["headers"], {"X-Agent-Key": AGENT_KEY})
 
-        with patch.dict(os.environ, {"TRIPWIRE_ADMIN_TOKEN": ADMIN_TOKEN}):
+        with patch.dict(os.environ, {"TRIPWIRE_ADMIN_TOKEN": ADMIN_TOKEN, "TRIPWIRE_AGENT_API_KEY": AGENT_KEY}):
             with patch.object(sys, "argv", [str(DEMO_AGENT_PATH), "setup"]):
                 with patch.object(demo_agent, "http_json", return_value=(200, {})) as request:
                     with contextlib.redirect_stdout(io.StringIO()):
                         demo_agent.main()
             self.assertEqual(request.call_args.kwargs["headers"], {"X-Admin-Token": ADMIN_TOKEN})
+            self.assertEqual(request.call_args.args[2]["agent_id"], agent_id_from_key(AGENT_KEY))
 
     def test_unconfigured_authentication_fails_closed_over_http(self):
         directory = tempfile.TemporaryDirectory()

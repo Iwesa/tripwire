@@ -1,7 +1,14 @@
 # Tech Debt & Compromises
 
-- **Caller-Declared Trust**: Currently, agents can claim a URL is `trusted`, bypassing taint tracking. Must be moved to a `trusted_origins` list on the Mandate.
-- **Judge inside Transaction**: The LLM judge runs inside the SQLite write transaction, locking the DB for up to 20 seconds. Vulnerable to race conditions/kill-switch bypass.
-- **Float Validation**: `NaN` or `.005` amounts crash the engine or create execution mismatches.
-- **Cosine N-Grams for Emails**: Currently fails on TLD swaps and padded subdomains. Needs edit-distance.
-- **Audit File I/O**: `AuditLog` re-reads the entire file on every append. $O(N^2)$ scaling bottleneck.
+## Resolved
+
+- [x] Caller-declared source trust is replaced by mandate-controlled `trusted_origins`.
+- [x] The LLM judge runs before the write transaction; policy is re-evaluated against the stored mandate during admission.
+- [x] API payment amounts reject non-finite, non-positive, and over-precision values.
+- [x] Payee lookalike detection uses local-part edit distance and exact domain matching.
+- [x] Audit appends cache file state and the current chain head instead of re-reading the persisted log on every append.
+
+## Open
+
+- **Audit append verification remains O(N)**: appends reuse cached file contents, but still verify the in-memory chain before writing. A verified-head strategy could reduce this cost, with careful handling of external file edits.
+- **PayPal timeout reconciliation**: if PayPal accepts a payout but the response is lost, the reservation is released and a retry could pay twice. Reconciliation is not implemented.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import os
 import hmac
 import inspect
@@ -29,7 +30,7 @@ from .judge import LLMJudge, NullJudge
 from .models import MONEY_MOVING, Decision, Finding, Source, ToolCall, Verdict, call_from_dict, mandate_from_dict
 from .paypal import DryRunExecutor, PayPalClient, PayPalError
 from .policy import PolicyEngine
-from .storage import StateStore
+from .storage import ReservationRefused, StateStore
 
 
 # ---------- request schemas ----------
@@ -55,7 +56,8 @@ class MandateIn(BaseModel):
 
 
 class ToolCallIn(BaseModel):
-    agent_id: str
+    # Ignored: an agent's identity comes only from its API key (see agent_id_from_key).
+    agent_id: str | None = None
     tool: str
     amount: Decimal | None = None
     currency: str = "USD"
@@ -401,19 +403,29 @@ def create_app(executor=None, judge=None, audit: AuditLog | None = None, clock=t
         return {"agent_id": agent_id, "spent": str(spent), "remaining": str(m.budget_total - spent),
                 "tx_last_hour": recent, "revoked": m.revoked}
 
+    async def _deny(call: ToolCall, verdict: Verdict) -> JSONResponse:
+        """Record a blocked call in the audit log, then answer 403.
+
+        Blocked attempts are the firewall's most important evidence. A failing audit write must never soften
+        the decision, so it is logged and the call is still denied.
+        """
+        try:
+            await audit.append("tool_call_evaluated", call.agent_id,
+                               {"call": _audit_call(call),
+                                "verdict": _redact_audit_value(verdict.to_dict())})
+        except Exception:  # noqa: BLE001 - the denial stands even if the audit write fails
+            logging.getLogger("tripwire").exception("audit write failed for a denied call")
+        return JSONResponse(status_code=403, content={"decision": "deny", **verdict.to_dict()})
+
     # ---- the gateway: every agent tool call goes through here ----
     @app.post("/gateway/tool-call", dependencies=[Depends(require_agent_key)])
     @limiter.limit("50/minute")
     async def tool_call(request: Request, body: ToolCallIn):
         call = _parse(body, call_from_dict)
-        request_agent_id = agent_id_from_key(request.headers.get("X-Agent-Key", ""))
-        call.agent_id = request_agent_id
+        # Identity comes ONLY from the API key. Any agent_id in the payload is ignored, so a caller can
+        # never borrow another agent's mandate by naming it.
+        call.agent_id = agent_id_from_key(request.headers.get("X-Agent-Key", ""))
         data = await asyncio.to_thread(store.get_mandate, call.agent_id)
-        if data is None and body.agent_id and body.agent_id != request_agent_id:
-            legacy_id = body.agent_id
-            data = await asyncio.to_thread(store.get_mandate, legacy_id)
-            if data is not None:
-                call.agent_id = legacy_id
         if data is None:
             raise HTTPException(404, "no mandate for this agent")
         await asyncio.to_thread(store.expire_pending_tickets, clock())
@@ -430,7 +442,7 @@ def create_app(executor=None, judge=None, audit: AuditLog | None = None, clock=t
 
         deterministic = engine.evaluate(m, call, include_judge=False, include_classifier=True)
         if deterministic.decision == Decision.DENY:
-            return JSONResponse(status_code=403, content={"decision": "deny", **deterministic.to_dict()})
+            return await _deny(call, deterministic)
 
         judge_findings: list[Finding] = []
         if engine.judge is not None and call.tool in MONEY_MOVING and deterministic.decision < Decision.DENY:
@@ -445,21 +457,49 @@ def create_app(executor=None, judge=None, audit: AuditLog | None = None, clock=t
                 ))
         verdict = engine._combine(deterministic, judge_findings)
         if verdict.decision == Decision.DENY:
-            return JSONResponse(status_code=403, content={"decision": "deny", **verdict.to_dict()})
+            return await _deny(call, verdict)
+
+        prior_findings = [*deterministic.findings, *judge_findings]
+
+        def recheck_current_mandate(current, current_call: ToolCall, state):
+            current_trusted = set(current.trusted_origins)
+            current_call.sources = [
+                Source(
+                    url=source.url,
+                    trust="trusted" if _canonical_origin(source.url) in current_trusted else "untrusted",
+                    excerpt=source.excerpt,
+                )
+                for source in current_call.sources
+            ]
+            current_verdict = engine.evaluate(
+                current,
+                current_call,
+                state,
+                include_judge=False,
+                include_classifier=False,
+            )
+            return engine._combine(current_verdict, prior_findings)
 
         try:
-            reservation_id = await asyncio.to_thread(
-                store.reserve_budget,
+            verdict, reservation_id = await asyncio.to_thread(
+                store.atomic_admit,
                 m,
                 call,
                 clock(),
-                verdict=verdict,
+                recheck_current_mandate,
                 allow_escalate=True,
+            )
+        except ReservationRefused as refusal:
+            # The stored state refused admission; return an audited denial rather than a 500.
+            return await _deny(
+                call, engine._combine(verdict, [Finding(refusal.rule, Decision.DENY, refusal.detail)])
             )
         except Exception:
             if verdict.decision == Decision.ESCALATE:
                 await audit.append("approval_requested", call.agent_id, {"ticket": "rejected"})
             raise
+        if verdict.decision == Decision.DENY:
+            return await _deny(call, verdict)
 
         try:
             await audit.append("tool_call_evaluated", call.agent_id,

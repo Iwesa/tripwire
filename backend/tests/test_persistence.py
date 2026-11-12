@@ -15,9 +15,15 @@ from fastapi.responses import JSONResponse
 from starlette.requests import Request
 
 from app.audit import AuditLog
-from app.main import ApprovalIn, MandateIn, ToolCallIn, _audit_call, create_app
+from app.main import ApprovalIn, MandateIn, ToolCallIn, _audit_call, agent_id_from_key, create_app
 from app.judge import JudgeResult
 from app.models import Decision, call_from_dict
+
+
+# The gateway derives the agent's identity from its API key and ignores any agent_id in the payload.
+AGENT_KEY = "agent-key-" + "a" * 48
+AGENT_ID = agent_id_from_key(AGENT_KEY)
+AGENT_HEADERS = [(b"x-agent-key", AGENT_KEY.encode())]
 
 
 class ImmediateExecutor:
@@ -91,7 +97,7 @@ class FailAuditEvent(AuditLog):
 
 def mandate_payload(**overrides):
     payload = {
-        "agent_id": "agent-1",
+        "agent_id": AGENT_ID,
         "task": "pay the approved vendor",
         "budget_total": "100.00",
         "per_tx_cap": "60.00",
@@ -107,7 +113,7 @@ def mandate_payload(**overrides):
 
 def call_payload(amount="30.00"):
     return {
-        "agent_id": "agent-1",
+        "agent_id": AGENT_ID,
         "tool": "create_payout",
         "amount": amount,
         "currency": "USD",
@@ -130,7 +136,7 @@ def invoke(app, path, *args, method="GET", **kwargs):
             "type": "http",
             "method": method,
             "path": path,
-            "headers": [],
+            "headers": AGENT_HEADERS,
             "client": ("127.0.0.1", 50000),
             "server": ("testserver", 80),
             "scheme": "http",
@@ -237,7 +243,7 @@ class PersistentState(unittest.TestCase):
             second_app = create_app(executor=ImmediateExecutor(), database_url=database_url)
             cleanup.callback(second_app.state.store.dispose)
             mandates = invoke(second_app, "/mandates")[1]
-            self.assertEqual(mandates[0]["agent_id"], "agent-1")
+            self.assertEqual(mandates[0]["agent_id"], AGENT_ID)
             pending = invoke(second_app, "/approvals", status="pending")[1]
             self.assertEqual([ticket["id"] for ticket in pending], [ticket_id])
             approval_status, approval = invoke(
@@ -248,7 +254,7 @@ class PersistentState(unittest.TestCase):
 
             third_app = create_app(executor=ImmediateExecutor(), database_url=database_url)
             cleanup.callback(third_app.state.store.dispose)
-            state = invoke(third_app, "/state/{agent_id}", "agent-1")[1]
+            state = invoke(third_app, "/state/{agent_id}", AGENT_ID)[1]
             self.assertEqual(state["spent"], "30.00")
             self.assertEqual(state["tx_last_hour"], 1)
             approved = invoke(third_app, "/approvals", status="approved")[1]
@@ -280,7 +286,7 @@ class PersistentState(unittest.TestCase):
             self.assertEqual(first_result[0], 200)
             self.assertEqual(second[0], 403)
             self.assertEqual(executor.calls, 1)
-            state = invoke(app, "/state/{agent_id}", "agent-1")[1]
+            state = invoke(app, "/state/{agent_id}", AGENT_ID)[1]
             self.assertEqual(Decimal(state["spent"]), Decimal("60.00"))
 
     def test_failed_execution_releases_its_reservation(self):
@@ -299,7 +305,7 @@ class PersistentState(unittest.TestCase):
             with self.assertRaises(HTTPException):
                 invoke(app, "/gateway/tool-call", request, method="POST")
 
-            state_after_failure = invoke(app, "/state/{agent_id}", "agent-1")[1]
+            state_after_failure = invoke(app, "/state/{agent_id}", AGENT_ID)[1]
             self.assertEqual(state_after_failure["spent"], "0")
             self.assertEqual(state_after_failure["tx_last_hour"], 0)
             status, result = invoke(app, "/gateway/tool-call", request, method="POST")
@@ -415,7 +421,7 @@ class AuditRequestIntegrity(unittest.TestCase):
             invoke(app, "/gateway/tool-call", ToolCallIn(**call_payload("30.00")), method="POST")
 
         self.assertEqual(executor.calls, 0)
-        state = invoke(app, "/state/{agent_id}", "agent-1")[1]
+        state = invoke(app, "/state/{agent_id}", AGENT_ID)[1]
         self.assertEqual(state["spent"], "0")
 
     def test_successful_action_has_durable_intent_if_completion_write_fails(self):
@@ -456,7 +462,7 @@ class AuditRequestIntegrity(unittest.TestCase):
         pending = invoke(app, "/approvals", status="pending")[1]
         self.assertEqual([ticket["id"] for ticket in pending], [ticket_id])
         self.assertEqual(executor.calls, 0)
-        self.assertEqual(invoke(app, "/state/{agent_id}", "agent-1")[1]["spent"], "30.00")
+        self.assertEqual(invoke(app, "/state/{agent_id}", AGENT_ID)[1]["spent"], "30.00")
 
     def test_concurrent_approval_requests_execute_ticket_once(self):
         audit = AuditLog()
@@ -531,7 +537,7 @@ class AsyncExecutionCancellation(unittest.IsolatedAsyncioTestCase):
                     "type": "http",
                     "method": "POST",
                     "path": "/gateway/tool-call",
-                    "headers": [],
+                    "headers": AGENT_HEADERS,
                     "client": ("127.0.0.1", 50000),
                     "server": ("testserver", 80),
                     "scheme": "http",

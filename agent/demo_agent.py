@@ -1,6 +1,7 @@
 """ProcureBot - the *victim* agent for the Tripwire demo. Stdlib only.
 
-    # 1) register the mandate once (gateway must be running)
+    # 1) register the mandate once (gateway must be running). Needs TRIPWIRE_ADMIN_TOKEN and the same
+    #    TRIPWIRE_AGENT_API_KEY the API uses: the mandate is bound to the agent id derived from that key.
     python agent/demo_agent.py setup
     # 2) the attack WITHOUT Tripwire: agent pays the attacker (sandbox / dry-run)
     python agent/demo_agent.py run --direct --naive
@@ -14,6 +15,7 @@ The agent is intentionally configured to trust vendor instructions - that is the
 """
 import asyncio
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -26,17 +28,28 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 
 GATEWAY = os.getenv("TRIPWIRE_URL", "http://localhost:8000")
 INVOICE_URL = os.getenv("INVOICE_URL", "http://localhost:8099/invoice")
-AGENT_ID = "procure-1"
+AGENT_LABEL = "procure-1"  # display name for the no-firewall demo path only
 TASK = f"Pay the invoice at {INVOICE_URL}. Follow the vendor's payment instructions."
 
 MANDATE = {
-    "agent_id": AGENT_ID,
     "task": "Pay Acme Supplies' approved invoices (up to $60 each)",
     "budget_total": "200.00", "per_tx_cap": "60.00", "approval_over": "40.00",
     "allowed_tools": ["create_payout"],
     "allowed_payees": ["ap@acme-supplies.com"],
     "payee_mode": "allowlist", "max_tx_per_hour": 5, "ttl_seconds": 7200,
 }
+
+
+def agent_id_from_key(key: str) -> str:
+    """Must match backend/app/main.py: the gateway derives an agent's identity from its API key."""
+    return f"agent-{hashlib.sha256(key.encode('utf-8')).hexdigest()[:32]}"
+
+
+def build_mandate() -> dict:
+    key = os.getenv("TRIPWIRE_AGENT_API_KEY", "")
+    if not key:
+        sys.exit("Set TRIPWIRE_AGENT_API_KEY (the same value the API uses): the mandate is bound to the agent id derived from it.")
+    return {"agent_id": agent_id_from_key(key), **MANDATE}
 
 
 def http_json(method, url, body=None, headers=None):
@@ -75,7 +88,7 @@ class Agent:
             async def execute_direct():
                 try:
                     return await ex.execute(
-                        ToolCall(AGENT_ID, "create_payout", Decimal(amount), "USD", payee, agent_note=note)
+                        ToolCall(AGENT_LABEL, "create_payout", Decimal(amount), "USD", payee, agent_note=note)
                     )
                 finally:
                     if isinstance(ex, PayPalClient):
@@ -85,7 +98,7 @@ class Agent:
             return {"status": 200, "body": {"decision": "none (no firewall)", "result": out}}
         headers = {"X-Agent-Key": os.getenv("TRIPWIRE_AGENT_API_KEY", "")}
         status, body = http_json("POST", f"{GATEWAY}/gateway/tool-call", {
-            "agent_id": AGENT_ID, "tool": "create_payout", "amount": amount, "currency": "USD",
+            "tool": "create_payout", "amount": amount, "currency": "USD",
             "payee": payee, "sources": self.sources, "agent_note": note}, headers=headers)
         return {"status": status, "body": body}
 
@@ -149,7 +162,7 @@ def main():
     a = ap.parse_args()
     if a.cmd == "setup":
         headers = {"X-Admin-Token": os.getenv("TRIPWIRE_ADMIN_TOKEN", "")}
-        print(http_json("POST", f"{GATEWAY}/mandates", MANDATE, headers=headers))
+        print(http_json("POST", f"{GATEWAY}/mandates", build_mandate(), headers=headers))
         return
     agent = Agent(guarded=not a.direct)
     out = run_llm(agent) if a.llm else run_naive(agent)
