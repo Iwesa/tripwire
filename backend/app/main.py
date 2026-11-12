@@ -11,6 +11,7 @@ import inspect
 import re
 import time
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Literal
@@ -237,12 +238,22 @@ def create_app(executor=None, judge=None, audit: AuditLog | None = None, clock=t
         injection_classifier=injection_classifier,
     )
 
-    app = FastAPI(title="Tripwire", description="Spend firewall for AI agents (PayPal sandbox)")
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        try:
+            yield
+        finally:
+            if isinstance(executor, PayPalClient):
+                await executor.aclose()
+
+    app = FastAPI(
+        title="Tripwire",
+        description="Spend firewall for AI agents (PayPal sandbox)",
+        lifespan=lifespan,
+    )
     limiter = Limiter(key_func=get_remote_address)
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-    if isinstance(executor, PayPalClient):
-        app.add_event_handler("shutdown", executor.aclose)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=os.getenv("TRIPWIRE_CORS", "http://localhost:5173").split(","),
